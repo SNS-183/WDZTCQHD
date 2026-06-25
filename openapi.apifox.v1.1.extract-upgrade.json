@@ -1,0 +1,895 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "WDZTCQHDFW API",
+    "version": "1.1.0",
+    "description": "根据 api_adapter.py 路由自动整理，可直接导入 Apifox。\n\nv1.1：升级 /extract 支持多主题(topic_k)与可视化矩阵(matrix)/全局主题表(topics)，并补充字段中文说明。"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:5000",
+      "description": "本地 Flask 服务"
+    }
+  ],
+  "tags": [
+    {
+      "name": "主题提取"
+    },
+    {
+      "name": "词云"
+    },
+    {
+      "name": "任务"
+    }
+  ],
+  "paths": {
+    "/extract": {
+      "post": {
+        "tags": [
+          "主题提取"
+        ],
+        "summary": "提取文档主题（v1.1 支持多主题 + 可视化矩阵）",
+        "description": "支持单文本(text)或多文本(texts)输入。\n- v1：每篇文档输出 1 个主题（topic_index 固定为 1）。\n- v1.1：支持设置 topic_k 生成 K 个全局主题，并可返回 topics（全局主题表）与 matrix（文档-主题矩阵），用于热力图/折线图等可视化。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtractRequest"
+              },
+              "examples": {
+                "single": {
+                  "summary": "单文本",
+                  "value": {
+                    "text": "社区早餐工程提升居民生活便利性。"
+                  }
+                },
+                "multi": {
+                  "summary": "多文本",
+                  "value": {
+                    "texts": [
+                      "第一段文本",
+                      "第二段文本"
+                    ]
+                  }
+                },
+                "multi_k5": {
+                  "summary": "多文本 + 5个主题 + 返回矩阵",
+                  "value": {
+                    "texts": [
+                      "第一段文本",
+                      "第二段文本",
+                      "第三段文本"
+                    ],
+                    "topic_k": 5,
+                    "topn_keywords": 10,
+                    "granularity": "sentence",
+                    "with_evidence": true,
+                    "evidence_topn": 30,
+                    "return_topics": true,
+                    "return_matrix": true,
+                    "normalize_score": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/word": {
+      "post": {
+        "tags": [
+          "词云"
+        ],
+        "summary": "获取词云数据",
+        "description": "支持单文本(text)或多文本(texts)输入，并可配置词性、词长、证据句等参数。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WordRequest"
+              },
+              "example": {
+                "text": "社区便民服务和早餐供给能力持续提升。",
+                "topk": 50,
+                "min_len": 2,
+                "max_len": 6,
+                "allowed_pos": [
+                  "n",
+                  "nt",
+                  "nz",
+                  "vn",
+                  "v",
+                  "eng"
+                ],
+                "remove_substrings": false,
+                "with_evidence": true,
+                "evidence_topn": 30
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WordResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "请求参数错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/task": {
+      "get": {
+        "tags": [
+          "任务"
+        ],
+        "summary": "获取最近处理文档",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ExtractRequest": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "单文本输入：直接传入一段文本（与 texts 二选一）。"
+          },
+          "texts": {
+            "type": "array",
+            "description": "多文本输入：传入多段文本数组（与 text 二选一）。数组顺序将作为 file_index。",
+            "items": {
+              "type": "string"
+            }
+          },
+          "topic_k": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 5,
+            "description": "主题数量 K：在多文档整体语料上生成 K 个全局主题（topic_index=1..K）。用于折线图/热力图等多主题可视化。"
+          },
+          "topn_keywords": {
+            "type": "integer",
+            "minimum": 3,
+            "maximum": 50,
+            "default": 10,
+            "description": "每个主题输出的关键词数量：用于 keyword_details/keywords 列表长度控制。"
+          },
+          "granularity": {
+            "type": "string",
+            "enum": [
+              "sentence",
+              "doc"
+            ],
+            "default": "sentence",
+            "description": "主题建模粒度：sentence=以句子为最小单位聚类/建模（推荐，跨文档主题更稳定）；doc=以整篇文档为单位建模（更快，但主题区分度可能较弱）。"
+          },
+          "with_evidence": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否返回证据句：true 时，theme_evidence 与 keyword_details.source.evidence 尽量给出对应原文句子；false 时可提升速度。"
+          },
+          "evidence_topn": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 30,
+            "description": "证据搜索/候选句上限：控制为关键词/主题寻找证据句时的候选范围（越大越慢，证据覆盖更高）。"
+          },
+          "return_topics": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否返回全局主题表 topics：用于前端展示主题列表、主题卡片等。"
+          },
+          "return_matrix": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否返回文档-主题矩阵 matrix：直接供热力图/折线图使用，避免前端二次聚合。"
+          },
+          "normalize_score": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否将 doc-topic 关联度 score 归一化到 0~1：true 更适合可视化比较；false 则保留原始非负得分。"
+          },
+          "debug": {
+            "type": "boolean",
+            "default": false,
+            "description": "调试开关：true 时可能返回额外中间信息（如句子数量、聚类统计），仅用于开发排查。"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "texts"
+            ]
+          }
+        ]
+      },
+      "WordRequest": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "单文本输入"
+          },
+          "texts": {
+            "type": "array",
+            "description": "多文本输入",
+            "items": {
+              "type": "string"
+            }
+          },
+          "topk": {
+            "type": "integer",
+            "minimum": 10,
+            "maximum": 200,
+            "default": 50
+          },
+          "min_len": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 6,
+            "default": 2
+          },
+          "max_len": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 10,
+            "default": 6
+          },
+          "allowed_pos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "n",
+              "nt",
+              "nz",
+              "vn",
+              "v",
+              "eng"
+            ]
+          },
+          "remove_substrings": {
+            "type": "boolean",
+            "default": false
+          },
+          "with_evidence": {
+            "type": "boolean",
+            "default": false
+          },
+          "evidence_topn": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "description": "仅传入时生效；未传时后端默认 min(topk, 60)"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "texts"
+            ]
+          }
+        ]
+      },
+      "ExtractResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 200
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "themes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Theme"
+                },
+                "description": "主题结果列表：按文档与主题索引展开（doc-topic）。用于主题卡、关系图等。"
+              },
+              "file_count": {
+                "type": "integer",
+                "description": "文档数量：等于 files.length。"
+              },
+              "theme_count": {
+                "type": "integer",
+                "description": "主题记录数：通常为 file_count * topic_k。"
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/FileInfo"
+                },
+                "description": "文档信息列表：包含每篇文档的统计与元信息。"
+              },
+              "statistics": {
+                "$ref": "#/components/schemas/ExtractStatistics",
+                "description": "统计信息：耗时、版本、数量等。"
+              },
+              "topics": {
+                "type": "array",
+                "description": "全局主题表（可选）：每个 topic_index 的统一主题名称与关键词（跨文档一致）。建议用于前端主题选择器/图例。",
+                "items": {
+                  "$ref": "#/components/schemas/Topic"
+                }
+              },
+              "matrix": {
+                "$ref": "#/components/schemas/DocTopicMatrix"
+              }
+            }
+          }
+        },
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ]
+      },
+      "Theme": {
+        "type": "object",
+        "properties": {
+          "theme": {
+            "type": "string",
+            "description": "主题名称/主题短语：对 topic_index 的可读化命名（可由关键词自动生成或摘要提取）。"
+          },
+          "keywords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "关键词列表（简版）：通常由 keyword_details 的 text 提取而来。"
+          },
+          "file_index": {
+            "type": "integer",
+            "description": "文档序号：从 1 开始，对应 texts 数组顺序或上传顺序。"
+          },
+          "id": {
+            "type": "string",
+            "description": "主题记录ID：通常为 {file_id}-t{topic_index} 或类似格式，便于前端定位。"
+          },
+          "summary": {
+            "type": "string",
+            "description": "主题摘要：对该文档在该主题下的简要概括（可选）。"
+          },
+          "keyword_details": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeywordDetail"
+            },
+            "description": "关键词详情：包含权重 weight、出现次数 count、证据 source 等。"
+          },
+          "theme_evidence": {
+            "type": "string",
+            "description": "主题证据句：从原文中选取的一句代表性语句，用于解释主题来源。"
+          },
+          "confidence": {
+            "type": "number",
+            "format": "float",
+            "description": "主题置信度：0~1，表示主题命名/聚类稳定性或模型自信程度（实现可自定义）。"
+          },
+          "topic_index": {
+            "type": "integer",
+            "description": "全局主题索引：从 1..K。跨文档一致，热力图/折线图的横轴维度。"
+          },
+          "file_id": {
+            "type": "string",
+            "description": "文档ID：如 doc1、doc2。与 files[].id 对应。"
+          },
+          "score": {
+            "type": "number",
+            "format": "float",
+            "description": "文档-主题关联度：表示该文档与该 topic_index 的相关强度。用于热力图/折线图的数值。"
+          }
+        }
+      },
+      "KeywordDetail": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "关键词文本。"
+          },
+          "weight": {
+            "type": "number",
+            "format": "float",
+            "description": "关键词权重：可由 TF-IDF/聚类中心权重/统计权重等计算，用于排序与可视化。"
+          },
+          "count": {
+            "type": "integer",
+            "description": "关键词出现次数：在当前文档或当前主题语料中的出现频次（实现可定义，但需保持一致）。"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceInfo",
+            "description": "证据信息：给出关键词对应的原文句子位置与内容（若开启 with_evidence）。"
+          }
+        }
+      },
+      "SourceInfo": {
+        "type": "object",
+        "properties": {
+          "sentence_index": {
+            "type": "integer",
+            "description": "句子序号：从 1 开始，表示证据句在该文档分句后的索引。"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "证据句原文：用于向用户解释关键词/主题的来源。"
+          }
+        }
+      },
+      "FileInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "doc1",
+            "description": "文档ID：后端生成的唯一标识。"
+          },
+          "name": {
+            "type": "string",
+            "example": "文档1",
+            "description": "文档显示名称：用于前端列表展示。"
+          },
+          "index": {
+            "type": "integer",
+            "description": "文档序号：从 1 开始。"
+          },
+          "word_count": {
+            "type": "integer",
+            "description": "词数统计：用于展示与分析规模估计。"
+          },
+          "sentence_count": {
+            "type": "integer",
+            "description": "句子数量：分句后统计，用于证据与粒度相关逻辑。"
+          },
+          "language": {
+            "type": "string",
+            "example": "zh",
+            "description": "语言标记：如 zh/en，用于分词与停用词策略选择。"
+          },
+          "upload_time": {
+            "type": "string",
+            "example": "2026-02-10 11:20:30",
+            "description": "处理/上传时间：字符串格式，便于前端展示。"
+          }
+        }
+      },
+      "ExtractStatistics": {
+        "type": "object",
+        "properties": {
+          "file_count": {
+            "type": "integer",
+            "description": "参与分析的文档数量。"
+          },
+          "theme_count": {
+            "type": "integer",
+            "description": "输出的主题记录条数：通常为 file_count * topic_k。"
+          },
+          "processing_time_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "后端处理耗时（毫秒）。"
+          },
+          "algorithm_version": {
+            "type": "string",
+            "description": "算法/接口版本号，用于区分实现与回溯。",
+            "example": "http-v1.1.0"
+          }
+        }
+      },
+      "WordResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 200
+          },
+          "msg": {
+            "type": "string",
+            "example": "获取词云成功"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "topk": {
+                "type": "integer"
+              },
+              "min_len": {
+                "type": "integer"
+              },
+              "max_len": {
+                "type": "integer"
+              },
+              "word_count": {
+                "type": "integer"
+              },
+              "words": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WordItem"
+                }
+              },
+              "meta": {
+                "$ref": "#/components/schemas/WordMeta"
+              },
+              "stats": {
+                "$ref": "#/components/schemas/WordStats"
+              },
+              "limits": {
+                "$ref": "#/components/schemas/WordLimits"
+              },
+              "pos_options": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PosOption"
+                }
+              },
+              "evidence_map": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/EvidenceItem"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "code",
+          "msg",
+          "data"
+        ]
+      },
+      "WordItem": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "weight": {
+            "type": "number",
+            "format": "float"
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      },
+      "WordMeta": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string"
+          },
+          "input_type": {
+            "type": "string",
+            "enum": [
+              "text",
+              "texts"
+            ]
+          },
+          "input_count": {
+            "type": "integer"
+          },
+          "input_chars": {
+            "type": "integer"
+          },
+          "allowed_pos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "remove_substrings": {
+            "type": "boolean"
+          },
+          "unique_words": {
+            "type": "integer"
+          },
+          "total_tokens": {
+            "type": "integer"
+          },
+          "tail_count1_ratio": {
+            "type": "number",
+            "format": "float"
+          },
+          "evidence_enabled": {
+            "type": "boolean"
+          },
+          "evidence_topn_effective": {
+            "type": "integer"
+          },
+          "evidence_coverage": {
+            "type": "number",
+            "format": "float"
+          }
+        }
+      },
+      "WordStats": {
+        "type": "object",
+        "properties": {
+          "processing_time_ms": {
+            "type": "number",
+            "format": "float"
+          },
+          "max_count": {
+            "type": "integer"
+          },
+          "min_count": {
+            "type": "integer"
+          }
+        }
+      },
+      "WordLimits": {
+        "type": "object",
+        "properties": {
+          "topk": {
+            "$ref": "#/components/schemas/RangeInt"
+          },
+          "min_len": {
+            "$ref": "#/components/schemas/RangeInt"
+          },
+          "max_len": {
+            "$ref": "#/components/schemas/RangeInt"
+          }
+        }
+      },
+      "RangeInt": {
+        "type": "object",
+        "properties": {
+          "min": {
+            "type": "integer"
+          },
+          "max": {
+            "type": "integer"
+          }
+        }
+      },
+      "PosOption": {
+        "type": "object",
+        "properties": {
+          "pos": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "EvidenceItem": {
+        "type": "object",
+        "properties": {
+          "sentence_index": {
+            "type": "integer"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "fallback": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TaskResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 200
+          },
+          "msg": {
+            "type": "string",
+            "example": "获取成功"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileInfo"
+            }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 400
+          },
+          "msg": {
+            "type": "string",
+            "example": "参数错误"
+          }
+        },
+        "required": [
+          "code",
+          "msg"
+        ]
+      },
+      "Topic": {
+        "type": "object",
+        "properties": {
+          "topic_index": {
+            "type": "integer",
+            "description": "全局主题索引：1..K，与 Theme.topic_index 对应。"
+          },
+          "theme": {
+            "type": "string",
+            "description": "全局主题名称：该 topic_index 的统一命名。"
+          },
+          "keyword_details": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeywordDetail"
+            },
+            "description": "该主题的关键词详情（全局层面）。"
+          },
+          "keywords": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "该主题的关键词列表（简版）。"
+          }
+        },
+        "required": [
+          "topic_index",
+          "theme"
+        ]
+      },
+      "DocTopicMatrix": {
+        "type": "object",
+        "description": "文档-主题矩阵：直接供热力图/折线图使用。",
+        "properties": {
+          "x": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "横轴主题索引列表：通常为 [1..K]。"
+          },
+          "y": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "纵轴文档ID列表：与 files[].id 一致，顺序对应 values 的行。"
+          },
+          "values": {
+            "type": "array",
+            "description": "矩阵数值：二维数组 values[row][col]，row 对应 y 文档，col 对应 x 主题。",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
+            }
+          },
+          "data": {
+            "type": "array",
+            "description": "稀疏三元组形式（可选）：[xIdx, yIdx, value]，更贴合 ECharts heatmap 数据格式。",
+            "items": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number",
+                  "format": "float"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,9 +1,34 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import logging
 import time
 
-from app_logic import extract_themes_from_text, split_sentences  # 注意：split_sentences 也从 app_logic 引入
+import pymysql
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from app_logic import (
+    build_extract_result,
+    build_wordcloud_data,
+    parse_extract_params,
+    parse_extract_texts,
+    parse_request_file_names,
+    parse_wordcloud_params,
+    parse_wordcloud_texts,
+)
+from database import (
+    clear_task_history,
+    create_user,
+    delete_task_by_id,
+    fetch_task_detail,
+    fetch_recent_files,
+    find_user_by_username,
+    find_user_id_by_username,
+    find_existing_document_names,
+    init_database,
+    save_extract_result,
+    save_wordcloud_result,
+)
+
 
 app = Flask(__name__)
 CORS(app)
@@ -12,34 +37,86 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ================== 全局“最近文件列表” ==================
-# 仅在服务运行期间有效，用于首页“最近上传文档”展示
-recent_files = []     # 每个元素结构类似：
-# {
-#     "id": "doc1",
-#     "name": "文档1",
-#     "index": 1,
-#     "word_count": 120,
-#     "sentence_count": 5,
-#     "language": "zh",
-#     "upload_time": "2025-11-17 10:32:45"
-# }
-MAX_RECENT = 20       # 最多保留最近 20 条
+MAX_RECENT = 20
 
 
-def guess_language(text: str) -> str:
-    """非常粗糙的语言检测：中文字符比例 > 0.3 就当中文."""
-    if not text:
-        return "unknown"
-    total = len(text)
-    cn = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
-    ratio = cn / max(total, 1)
-    return "zh" if ratio > 0.3 else "en"
+def _parse_auth_payload():
+    """解析登录/注册请求体，只接收用户名和密码。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return None, None, ("请求体必须为 JSON 对象", 400)
+
+    username = str(request_data.get("username", "") or "").strip()
+    password = str(request_data.get("password", "") or "")
+    if not username or not password:
+        return None, None, ("请填写用户名与密码", 400)
+    if len(username) > 32:
+        return None, None, ("用户名长度不能超过 32 个字符", 400)
+    if len(password) < 6:
+        return None, None, ("密码长度不能少于 6 位", 400)
+    return username, password, None
 
 
-@app.route("/api/extract-interests", methods=["POST", "OPTIONS"])
+@app.route("/api/auth/register", methods=["POST", "OPTIONS"])
+def register_user():
+    """注册用户账号，并将密码哈希写入数据库。"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
+    username, password, error = _parse_auth_payload()
+    if error:
+        msg, status_code = error
+        return jsonify({"code": status_code, "msg": msg}), status_code
+
+    try:
+        user = create_user(username, generate_password_hash(password))
+        return jsonify({
+            "code": 200,
+            "msg": "注册成功",
+            "data": {
+                "id": user["user_id"],
+                "username": user["username"],
+            },
+        }), 200
+    except pymysql.err.IntegrityError:
+        return jsonify({"code": 409, "msg": "用户名已存在，请更换用户名"}), 409
+    except Exception as exc:
+        logger.error(f"注册用户失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：注册失败"}), 500
+
+
+@app.route("/api/auth/login", methods=["POST", "OPTIONS"])
+def login_user():
+    """校验数据库中的用户名与密码，未注册用户无法登录。"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
+    username, password, error = _parse_auth_payload()
+    if error:
+        msg, status_code = error
+        return jsonify({"code": status_code, "msg": msg}), status_code
+
+    try:
+        user = find_user_by_username(username)
+        if user is None or not check_password_hash(user["password_hash"], password):
+            return jsonify({"code": 401, "msg": "用户名或密码错误"}), 401
+
+        return jsonify({
+            "code": 200,
+            "msg": "登录成功",
+            "data": {
+                "id": int(user["user_id"]),
+                "username": user["username"],
+            },
+        }), 200
+    except Exception as exc:
+        logger.error(f"登录用户失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：登录失败"}), 500
+
+
+@app.route("/extract", methods=["POST", "OPTIONS"])
 def extract_interests():
-    # 处理预检请求（CORS 用）
+    """统一处理主题提取与词云请求。"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
@@ -52,165 +129,187 @@ def extract_interests():
         if not isinstance(request_data, dict):
             return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
 
-        # 支持单文件和多文件两种格式
-        if "text" in request_data:
-            texts = [request_data["text"]]
-        elif "texts" in request_data and isinstance(request_data["texts"], list):
-            texts = request_data["texts"]
-        else:
-            return jsonify({
-                "code": 400,
-                "msg": "参数错误：请提供 'text' 字段或 'texts' 数组"
-            }), 400
+        wordcloud_only = request_data.get("wordcloud_only", False)
+        if not isinstance(wordcloud_only, bool):
+            return jsonify({"code": 400, "msg": "参数错误：wordcloud_only 必须为布尔值"}), 400
 
-        if not texts:
-            return jsonify({"code": 400, "msg": "参数错误：文本内容不能为空"}), 400
+        # 词云模式走独立服务层逻辑，但仍复用同一个接口。
+        if wordcloud_only:
+            texts, err_msg = parse_wordcloud_texts(request_data)
+            if err_msg:
+                return jsonify({"code": 400, "msg": err_msg}), 400
+
+            params, err_msg = parse_wordcloud_params(request_data)
+            if err_msg:
+                return jsonify({"code": 400, "msg": err_msg}), 400
+
+            start_ts = time.time()
+            wordcloud_data = build_wordcloud_data(texts, params)
+            wordcloud_data["stats"]["processing_time_ms"] = round((time.time() - start_ts) * 1000.0, 2)
+            response_data = {"code": 200, "msg": "获取词云成功", "data": wordcloud_data}
+            save_wordcloud_result(request_data, response_data)
+            return jsonify(response_data), 200
+
+        texts, err_msg = parse_extract_texts(request_data)
+        if err_msg:
+            return jsonify({"code": 400, "msg": err_msg}), 400
+
+        params, err_msg = parse_extract_params(request_data)
+        if err_msg:
+            return jsonify({"code": 400, "msg": err_msg}), 400
+
+        record_recent = request_data.get("record_recent", True)
+        if not isinstance(record_recent, bool):
+            return jsonify({"code": 400, "msg": "参数错误：record_recent 必须为布尔值"}), 400
+
+        file_names, err_msg = parse_request_file_names(request_data, len(texts))
+        if err_msg:
+            return jsonify({"code": 400, "msg": err_msg}), 400
+        unique_check_names = []
+        raw_unique_check_names = request_data.get("unique_name_file_names", [])
+        if isinstance(raw_unique_check_names, list):
+            unique_check_names = [
+                str(name).strip()
+                for name in raw_unique_check_names
+                if str(name).strip()
+            ]
+        elif request_data.get("unique_name_check") is True:
+            unique_check_names = [
+                str(name).strip()
+                for name in file_names
+                if str(name).strip()
+            ]
+        if unique_check_names:
+            duplicate_in_request = sorted({
+                name for name in unique_check_names if unique_check_names.count(name) > 1
+            })
+            if duplicate_in_request:
+                return jsonify({
+                    "code": 400,
+                    "msg": "文本录入文档名重复：" + "、".join(duplicate_in_request),
+                }), 400
+            existing_names = find_existing_document_names(unique_check_names)
+            if existing_names:
+                return jsonify({
+                    "code": 400,
+                    "msg": "文本录入文档名已存在，请更换标题后再抽取：" + "、".join(existing_names),
+                }), 400
 
         http_start_ts = time.time()
+        extract_result = build_extract_result(texts, file_names, params)
+        statistics = dict(extract_result["statistics"])
+        statistics["processing_time_ms"] = (time.time() - http_start_ts) * 1000.0
 
-        # ====== 新增：文件列表 & 统计 ======
-        all_files = []
-        all_themes = []
-        total_theme_count = 0
-
-        for i, text in enumerate(texts):
-            if text is None or not str(text).strip():
-                logger.warning(f"第 {i + 1} 个文件内容为空，跳过处理")
-                continue
-
-            text = str(text)
-            logger.info(f"处理第 {i + 1} 个文件，内容长度: {len(text)}")
-
-            try:
-                # ---- 1) 计算文件级信息 ----
-                file_index = i + 1
-                file_id = f"doc{file_index}"
-                language = guess_language(text)
-                sentences = split_sentences(text)
-                word_count = len(text)
-                sentence_count = len(sentences)
-
-                upload_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
-                file_info = {
-                    "id": file_id,
-                    "name": f"文档{file_index}",  # 如果前端有真实文件名，可以自己覆盖
-                    "index": file_index,
-                    "word_count": word_count,
-                    "sentence_count": sentence_count,
-                    "language": language,
-                    # 新增字段：文件“上传/请求时间”
-                    "upload_time": upload_time_str,
-                }
-                all_files.append(file_info)
-
-                # ---- 1.5) 保存到全局 recent_files，供首页“最近上传文档”使用 ----
-                recent_files.append(file_info)
-                # 控制最大长度（只保留最近 MAX_RECENT 条）
-                if len(recent_files) > MAX_RECENT:
-                    recent_files.pop(0)  # 删除最旧的一条
-
-                # ---- 2) 提取主题（沿用你原来的逻辑）----
-                themes_raw = extract_themes_from_text(text, n_themes=3, topk=3)
-
-                file_themes = []
-                for t_idx, t in enumerate(themes_raw, start=1):
-                    theme_word = t.get("theme", "")
-                    keywords = list(t.get("keywords", []))
-
-                    # 主题 id：doc1-t1 这种形式
-                    theme_id = f"{file_id}-t{t_idx}"
-
-                    # 简单给一个摘要：取文本前若干个字符
-                    summary = text[:80] + ("..." if len(text) > 80 else "")
-
-                    # 关键词详情：目前没有 TF-IDF 权重，这里简单给占位字段
-                    keyword_details = []
-                    for kw in keywords:
-                        keyword_details.append({
-                            "text": kw,
-                            "weight": 1.0,  # 如果后面你在 app_logic 里能拿到 TF-IDF 权重，就改成真实值
-                            "count": text.count(kw),
-                        })
-
-                    file_themes.append({
-                        # 旧字段（兼容老前端）
-                        "theme": theme_word,
-                        "keywords": keywords,
-                        "file_index": file_index,
-
-                        # 新字段（对齐你 gRPC 版的结构）
-                        "id": theme_id,
-                        "summary": summary,
-                        "keyword_details": keyword_details,
-                        "confidence": 0.8,   # 现在没有真实置信度，先给一个固定值，占位
-                        "topic_index": t_idx,
-                        "file_id": file_id,
-                    })
-
-                all_themes.extend(file_themes)
-                total_theme_count += len(file_themes)
-                logger.info(f"第 {i + 1} 个文件提取到 {len(file_themes)} 个主题")
-
-            except Exception as e:
-                logger.error(f"处理第 {i + 1} 个文件时错误: {str(e)}")
-                # 单个文件失败不影响其他文件
-                continue
-
-        http_end_ts = time.time()
-        http_cost_ms = (http_end_ts - http_start_ts) * 1000.0
-
-        statistics = {
-            "file_count": len(texts),
-            "theme_count": total_theme_count,
-            "processing_time_ms": http_cost_ms,
-            "algorithm_version": "http-v1.0.0",  # 你可以根据需要改成和模型/算法版本一致
-        }
-
+        total_theme_count = int(statistics["theme_count"])
+        total_doc_theme_count = int(statistics["doc_theme_count"])
         response_data = {
             "code": 200,
-            "msg": f"成功处理 {len(texts)} 个文件，提取到 {total_theme_count} 个主题",
+            "msg": (
+                f"成功处理 {len(extract_result['files'])} 个文件，"
+                f"提取到 {total_theme_count} 个全局主题（{total_doc_theme_count} 条文档主题关联）"
+            ),
             "data": {
-                # 旧字段（保持不变，方便你现有前端使用）
-                "themes": all_themes,
-                "file_count": len(texts),
+                "themes": extract_result["doc_themes"],
+                "doc_themes": extract_result["doc_themes"],
+                "file_count": len(extract_result["files"]),
                 "theme_count": total_theme_count,
-
-                # 新增字段（对齐 gRPC 版）
-                "files": all_files,
+                "doc_theme_count": total_doc_theme_count,
+                "files": extract_result["files"],
                 "statistics": statistics,
-            }
+            },
         }
+
+        if params["return_topics"]:
+            response_data["data"]["topics"] = extract_result["topics"]
+        if params["return_matrix"]:
+            response_data["data"]["matrix"] = extract_result["matrix"]
+            response_data["data"]["relation"] = extract_result["relation"]
+            response_data["data"]["heatmap"] = extract_result["heatmap"]
+        if params["debug"]:
+            response_data["data"]["debug"] = {
+                "request_params": params,
+                "modeled_topic_k": extract_result["debug"]["modeled_topic_k"],
+                "unit_count": extract_result["debug"]["unit_count"],
+                "record_recent": record_recent,
+            }
+
+        extract_user_id = None
+        extract_username = str(request_data.get("username", "") or "").strip()
+        if extract_username:
+            extract_user_id = find_user_id_by_username(extract_username)
+
+        if record_recent:
+            save_extract_result(
+                extract_result,
+                statistics,
+                request_payload=request_data,
+                response_payload=response_data,
+                user_id=extract_user_id,
+            )
 
         logger.info(f"请求处理完成，总共提取到 {total_theme_count} 个主题")
         return jsonify(response_data), 200
 
-    except Exception as e:
-        logger.error(f"服务器错误: {str(e)}")
-        return jsonify({"code": 500, "msg": f"服务器错误：{str(e)}"}), 500
+    except Exception as exc:
+        logger.error(f"服务器错误: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
 
 
-# ================== 新增：获取最近上传文档列表 ==================
-@app.route("/api/recent-docs", methods=["GET"])
+@app.route("/task", methods=["GET"])
 def get_recent_docs():
-    """
-    返回最近上传/处理的文档列表（供首页使用）
-    """
+    """返回最近上传/处理的文档列表。支持 ?username=xxx 过滤当前用户的任务。"""
     try:
-        # recent_files 中越新的在越后面，这里反转一下，让最新的排在前面
-        data = list(reversed(recent_files))
+        username = str(request.args.get("username", "") or "").strip() or None
+        return jsonify({"code": 200, "msg": "获取成功", "data": fetch_recent_files(username, MAX_RECENT)}), 200
+    except Exception as exc:
+        logger.error(f"获取 recent-docs 错误: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
 
-        return jsonify({
-            "code": 200,
-            "msg": "获取成功",
-            "data": data
-        }), 200
 
-    except Exception as e:
-        logger.error(f"获取 recent-docs 错误: {str(e)}")
-        return jsonify({"code": 500, "msg": f"服务器错误：{str(e)}"}), 500
+@app.route("/task/<int:task_id>", methods=["GET"])
+def get_task_detail(task_id: int):
+    """返回指定任务所在批次的完整分析结果。"""
+    try:
+        detail = fetch_task_detail(task_id)
+        if not detail:
+            return jsonify({"code": 404, "msg": "任务不存在"}), 404
+        return jsonify(detail), 200
+    except Exception as exc:
+        logger.error(f"获取任务详情错误: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+
+
+@app.route("/task/<int:task_id>", methods=["DELETE"])
+def delete_task(task_id: int):
+    """删除单条任务及其关联主题数据。"""
+    try:
+        request_data = request.get_json(silent=True)
+        username = str((request_data or {}).get("username", "") or "").strip() or None
+
+        deleted = delete_task_by_id(task_id, username)
+        if not deleted:
+            return jsonify({"code": 404, "msg": "任务不存在或无权限删除"}), 404
+        return jsonify({"code": 200, "msg": "删除任务成功", "data": {"task_id": int(task_id)}}), 200
+    except Exception as exc:
+        logger.error(f"删除任务错误: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+
+
+@app.route("/task", methods=["DELETE"])
+def clear_tasks():
+    """清空全部任务列表数据。"""
+    try:
+        result = clear_task_history()
+        return jsonify({"code": 200, "msg": "清空任务成功", "data": result}), 200
+    except Exception as exc:
+        logger.error(f"清空任务错误: {str(exc)}")
+        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
 
 
 if __name__ == "__main__":
-    # 直接把这个 Flask 服务当成主后端
+    try:
+        init_database()
+        logger.info("MySQL 数据库初始化完成")
+    except Exception as exc:
+        logger.error(f"MySQL 数据库初始化失败: {str(exc)}")
     app.run(host="0.0.0.0", port=5000, debug=True)
