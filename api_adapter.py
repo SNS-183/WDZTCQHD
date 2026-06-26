@@ -17,6 +17,7 @@ from app_logic import (
 )
 from database import (
     clear_task_history,
+    create_analysis_task_record,
     create_user,
     delete_task_by_id,
     fetch_task_detail,
@@ -27,6 +28,8 @@ from database import (
     init_database,
     save_extract_result,
     save_wordcloud_result,
+    update_analysis_task_status,
+    TASK_STATUS_ERROR,
 )
 
 
@@ -120,6 +123,7 @@ def extract_interests():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
+    pending_task_id = None
     try:
         request_data = request.get_json(silent=True)
         logger.info(
@@ -195,6 +199,15 @@ def extract_interests():
                     "msg": "文本录入文档名已存在，请更换标题后再抽取：" + "、".join(existing_names),
                 }), 400
 
+        extract_user_id = None
+        extract_username = str(request_data.get("username", "") or "").strip()
+        if extract_username:
+            extract_user_id = find_user_id_by_username(extract_username)
+
+        if record_recent:
+            # 先写入“分析中”批次，后续成功/失败都会更新该记录。
+            pending_task_id = create_analysis_task_record(request_data, user_id=extract_user_id)
+
         http_start_ts = time.time()
         extract_result = build_extract_result(texts, file_names, params)
         statistics = dict(extract_result["statistics"])
@@ -233,26 +246,33 @@ def extract_interests():
                 "record_recent": record_recent,
             }
 
-        extract_user_id = None
-        extract_username = str(request_data.get("username", "") or "").strip()
-        if extract_username:
-            extract_user_id = find_user_id_by_username(extract_username)
-
         if record_recent:
-            save_extract_result(
+            saved_task = save_extract_result(
                 extract_result,
                 statistics,
                 request_payload=request_data,
                 response_payload=response_data,
                 user_id=extract_user_id,
+                existing_task_id=pending_task_id,
             )
+            if isinstance(saved_task, dict):
+                # 前端需要用本次保存的文档主键回读整批结果，避免再用“最新任务”误命中旧数据。
+                response_data["data"]["saved_task"] = saved_task
+                response_data["data"]["task_id"] = saved_task.get("task_id")
+                response_data["data"]["batch_id"] = saved_task.get("batch_id")
 
         logger.info(f"请求处理完成，总共提取到 {total_theme_count} 个主题")
         return jsonify(response_data), 200
 
     except Exception as exc:
         logger.error(f"服务器错误: {str(exc)}")
-        return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+        error_response = {"code": 500, "msg": f"服务器错误：{str(exc)}"}
+        if pending_task_id:
+            try:
+                update_analysis_task_status(pending_task_id, TASK_STATUS_ERROR, error_response)
+            except Exception as status_exc:
+                logger.error(f"更新失败任务状态失败: {str(status_exc)}")
+        return jsonify(error_response), 500
 
 
 @app.route("/task", methods=["GET"])

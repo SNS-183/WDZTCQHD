@@ -9,6 +9,9 @@ import pymysql
 
 logger = logging.getLogger(__name__)
 _db_initialized = False
+TASK_STATUS_RUNNING = "分析中"
+TASK_STATUS_DONE = "已完成"
+TASK_STATUS_ERROR = "失败"
 
 
 def get_db_settings() -> dict:
@@ -208,6 +211,12 @@ def init_database():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            # 兼容旧库：历史库如果缺少任务状态列，启动时自动补齐。
+            cursor.execute("SHOW COLUMNS FROM analysis_tasks LIKE 'task_status'")
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "ALTER TABLE analysis_tasks ADD COLUMN task_status VARCHAR(32) NOT NULL DEFAULT '已完成' AFTER theme_count"
+                )
         connection.commit()
     _db_initialized = True
 
@@ -236,6 +245,77 @@ def _first_request_file_name(request_payload: dict | None) -> str:
     return str(file_name).strip() if file_name else ""
 
 
+def create_analysis_task_record(
+    request_payload: dict | None,
+    user_id: int | None = None,
+    status: str = TASK_STATUS_RUNNING,
+) -> int:
+    """先落一条批次任务记录，便于前端看到分析中/失败状态。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    now = datetime.now()
+    task_name = _first_request_file_name(request_payload) or f"分析任务{now.strftime('%Y%m%d%H%M%S')}"
+    file_count = 0
+    if isinstance(request_payload, dict):
+        raw_file_names = request_payload.get("file_names")
+        if isinstance(raw_file_names, list):
+            file_count = len(raw_file_names)
+        elif isinstance(request_payload.get("texts"), list):
+            file_count = len(request_payload.get("texts"))
+        elif request_payload.get("text"):
+            file_count = 1
+
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO analysis_tasks (
+                    task_name, file_count, theme_count, task_status,
+                    create_time, user_id, request_payload_json, response_payload_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    task_name,
+                    int(file_count),
+                    0,
+                    status,
+                    now,
+                    user_id,
+                    json.dumps(request_payload or {}, ensure_ascii=False),
+                    None,
+                ),
+            )
+            task_id = int(cursor.lastrowid)
+        connection.commit()
+        return task_id
+
+
+def update_analysis_task_status(
+    task_id: int,
+    status: str,
+    response_payload: dict | None = None,
+) -> None:
+    """更新任务状态和响应快照，失败信息也保留在数据库中。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE analysis_tasks
+                SET task_status = %s,
+                    response_payload_json = COALESCE(%s, response_payload_json)
+                WHERE task_id = %s
+                """,
+                (
+                    status,
+                    json.dumps(response_payload, ensure_ascii=False) if response_payload is not None else None,
+                    int(task_id),
+                ),
+            )
+        connection.commit()
+
+
 def _insert_normalized_extract_result(
     cursor,
     extract_result: dict,
@@ -243,32 +323,60 @@ def _insert_normalized_extract_result(
     request_payload: dict | None,
     response_payload: dict | None,
     user_id: int | None = None,
+    existing_task_id: int | None = None,
 ) -> int:
     """按六实体模型保存分析结果。"""
     now = datetime.now()
     task_name = _first_request_file_name(request_payload) or f"分析任务{now.strftime('%Y%m%d%H%M%S')}"
-    cursor.execute(
-        """
-        INSERT INTO analysis_tasks (
-            task_name, file_count, theme_count, task_status,
-            create_time, user_id, request_payload_json, response_payload_json
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            task_name,
-            int(statistics.get("file_count", 0)),
-            int(statistics.get("theme_count", 0)),
-            "已完成",
-            now,
-            user_id,
-            json.dumps(request_payload or {}, ensure_ascii=False),
-            json.dumps(response_payload or {}, ensure_ascii=False),
-        ),
-    )
-    task_id = int(cursor.lastrowid)
+    if existing_task_id:
+        task_id = int(existing_task_id)
+        cursor.execute(
+            """
+            UPDATE analysis_tasks
+            SET task_name = %s,
+                file_count = %s,
+                theme_count = %s,
+                task_status = %s,
+                user_id = %s,
+                request_payload_json = %s,
+                response_payload_json = %s
+            WHERE task_id = %s
+            """,
+            (
+                task_name,
+                int(statistics.get("file_count", 0)),
+                int(statistics.get("theme_count", 0)),
+                TASK_STATUS_DONE,
+                user_id,
+                json.dumps(request_payload or {}, ensure_ascii=False),
+                json.dumps(response_payload or {}, ensure_ascii=False),
+                task_id,
+            ),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO analysis_tasks (
+                task_name, file_count, theme_count, task_status,
+                create_time, user_id, request_payload_json, response_payload_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                task_name,
+                int(statistics.get("file_count", 0)),
+                int(statistics.get("theme_count", 0)),
+                TASK_STATUS_DONE,
+                now,
+                user_id,
+                json.dumps(request_payload or {}, ensure_ascii=False),
+                json.dumps(response_payload or {}, ensure_ascii=False),
+            ),
+        )
+        task_id = int(cursor.lastrowid)
 
     doc_items_by_file_id = {str(item.get("file_id", "")): item for item in extract_result.get("doc_items", [])}
     document_id_by_source_id = {}
+    saved_document_ids = []
     for file_info in extract_result.get("files", []):
         source_id = str(file_info.get("id", ""))
         doc_item = doc_items_by_file_id.get(source_id, {})
@@ -293,7 +401,9 @@ def _insert_normalized_extract_result(
                 json.dumps(doc_item.get("sentences", []), ensure_ascii=False),
             ),
         )
-        document_id_by_source_id[source_id] = int(cursor.lastrowid)
+        saved_document_id = int(cursor.lastrowid)
+        document_id_by_source_id[source_id] = saved_document_id
+        saved_document_ids.append(saved_document_id)
 
     for theme_info in extract_result.get("doc_themes", []):
         source_id = str(theme_info.get("file_id", ""))
@@ -367,7 +477,11 @@ def _insert_normalized_extract_result(
             now,
         ),
     )
-    return task_id
+    return {
+        "batch_id": task_id,
+        "document_task_ids": saved_document_ids,
+        "task_id": saved_document_ids[0] if saved_document_ids else None,
+    }
 
 
 def save_extract_result(
@@ -376,21 +490,24 @@ def save_extract_result(
     request_payload: dict | None = None,
     response_payload: dict | None = None,
     user_id: int | None = None,
+    existing_task_id: int | None = None,
 ):
     """保存一次 /extract 的处理结果到新表。"""
     ensure_database_ready()
     settings = get_db_settings()
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
-            _insert_normalized_extract_result(
+            saved_info = _insert_normalized_extract_result(
                 cursor,
                 extract_result,
                 statistics,
                 request_payload,
                 response_payload,
                 user_id=user_id,
+                existing_task_id=existing_task_id,
             )
         connection.commit()
+        return saved_info
 
 
 def save_wordcloud_result(request_payload: dict, response_payload: dict):
@@ -423,7 +540,7 @@ def find_existing_document_names(file_names: list[str]) -> list[str]:
 
 
 def fetch_recent_files(username: str | None = None, limit: int = 20) -> list[dict]:
-    """读取当前用户的最近处理文档列表，供 /task 返回。"""
+    """读取当前用户任务列表，包含已完成文档以及失败/分析中的批次记录。"""
     ensure_database_ready()
     settings = get_db_settings()
 
@@ -433,47 +550,39 @@ def fetch_recent_files(username: str | None = None, limit: int = 20) -> list[dic
 
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
+            base_sql = """
+                SELECT
+                    COALESCE(di.document_id, at.task_id) AS task_id,
+                    at.task_id AS batch_id,
+                    COALESCE(di.document_source_id, '') AS id,
+                    COALESCE(di.document_name, at.task_name) AS name,
+                    COALESCE(di.document_index, 0) AS `index`,
+                    COALESCE(di.word_count, 0) AS word_count,
+                    COALESCE(di.sentence_count, 0) AS sentence_count,
+                    COALESCE(di.language, '') AS language,
+                    DATE_FORMAT(COALESCE(di.upload_time, at.create_time), '%%Y-%%m-%%d %%H:%%i:%%s') AS upload_time,
+                    at.task_name,
+                    at.file_count AS doc_count,
+                    at.task_status AS status,
+                    at.task_status
+                FROM analysis_tasks at
+                LEFT JOIN document_info di ON di.task_id = at.task_id
+            """
             if user_id:
                 cursor.execute(
-                    """
-                    SELECT
-                        di.document_id AS task_id,
-                        di.task_id AS batch_id,
-                        di.document_source_id AS id,
-                        di.document_name AS name,
-                        di.document_index AS `index`,
-                        di.word_count,
-                        di.sentence_count,
-                        di.language,
-                        DATE_FORMAT(di.upload_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS upload_time,
-                        at.task_name,
-                        at.task_status
-                    FROM document_info di
-                    INNER JOIN analysis_tasks at ON at.task_id = di.task_id
+                    base_sql
+                    + """
                     WHERE at.user_id = %s
-                    ORDER BY di.upload_time DESC, di.document_id DESC
+                    ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
                     LIMIT %s
                     """,
                     (user_id, int(limit)),
                 )
             else:
                 cursor.execute(
-                    """
-                    SELECT
-                        di.document_id AS task_id,
-                        di.task_id AS batch_id,
-                        di.document_source_id AS id,
-                        di.document_name AS name,
-                        di.document_index AS `index`,
-                        di.word_count,
-                        di.sentence_count,
-                        di.language,
-                        DATE_FORMAT(di.upload_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS upload_time,
-                        at.task_name,
-                        at.task_status
-                    FROM document_info di
-                    INNER JOIN analysis_tasks at ON at.task_id = di.task_id
-                    ORDER BY di.upload_time DESC, di.document_id DESC
+                    base_sql
+                    + """
+                    ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
                     LIMIT %s
                     """,
                     (int(limit),),
@@ -611,12 +720,12 @@ def fetch_task_detail(task_id: int) -> dict | None:
 
 
 def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
-    """按任务 ID 删除，验证用户所有权。"""
+    """按文档任务 ID 或批次 ID 删除，验证用户所有权。"""
     ensure_database_ready()
     settings = get_db_settings()
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
-            # 先查任务归属
+            # 先按文档 ID 查批次，失败/分析中的任务可能还没有文档行。
             cursor.execute(
                 """
                 SELECT at.task_id, at.user_id
@@ -628,6 +737,17 @@ def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
                 (int(task_id),),
             )
             row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    """
+                    SELECT task_id, user_id
+                    FROM analysis_tasks
+                    WHERE task_id = %s
+                    LIMIT 1
+                    """,
+                    (int(task_id),),
+                )
+                row = cursor.fetchone()
             if not row:
                 return False
 
