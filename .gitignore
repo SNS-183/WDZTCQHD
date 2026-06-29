@@ -1,0 +1,165 @@
+# =========================
+
+# 日志文件
+
+# =========================
+
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# =========================
+
+# Node / Vue 依赖与构建产物
+
+# =========================
+
+node_modules/
+dist/
+dist-ssr/
+coverage/
+
+# Vite / Vue / TypeScript 构建缓存
+
+*.tsbuildinfo
+.eslintcache
+
+# =========================
+
+# Python 虚拟环境与缓存
+
+# 适用于后端目录或接口适配脚本
+
+# =========================
+
+.venv/
+venv/
+env/
+**pycache**/
+*.pyc
+*.pyo
+*.pyd
+
+# Python 测试与缓存目录
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+
+# 本地环境变量与私有配置
+
+# 注意：.env.example 不要忽略，建议提交作为配置模板
+
+# =========================
+
+.env
+.env.local
+.env.development.local
+.env.production.local
+*.local
+config.local.js
+
+# =========================
+
+# 编辑器 / IDE 配置
+
+# =========================
+
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# =========================
+
+# 系统文件
+
+# =========================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+
+# Office 文档与临时文件
+
+# 一般不建议把论文、说明文档、用户手册等提交到代码仓库
+
+# =========================
+
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+~$*.doc
+~$*.docx
+~$*.xls
+~$*.xlsx
+~$*.ppt
+~$*.pptx
+
+# =========================
+
+# PDF 文档
+
+# 如果 README 或项目说明必须用 PDF，可按需删除这一行
+
+# =========================
+
+*.pdf
+
+# =========================
+
+# 压缩包 / 备份包
+
+# 一般用于临时备份、交付包或资料包，不建议提交
+
+# =========================
+
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.gz
+
+# =========================
+
+# 临时文件 / 备份文件
+
+# =========================
+
+*.tmp
+*.temp
+*.bak
+*.old
+
+# =========================
+
+# Cypress 测试产物
+
+# =========================
+
+/cypress/videos/
+/cypress/screenshots/
+
+# =========================
+
+# Vitest / 截图测试产物
+
+# =========================
+
+**screenshots**/
