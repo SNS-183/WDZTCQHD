@@ -1,7 +1,11 @@
+import base64
+import html
 import logging
 import re
 import time
+import zipfile
 from collections import Counter
+from io import BytesIO
 from typing import Iterable
 
 import jieba.posseg as pseg
@@ -23,6 +27,7 @@ CN_STOP = set(
 
 ALLOWED_POS = {"n", "nt", "nz", "vn", "v", "eng"}
 GENERIC_THEME_SUFFIXES = ["主题", "治理", "服务", "发展"]
+SUPPORTED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".markdown", ".docx", ".doc", ".pdf"}
 
 
 def guess_language(text: str) -> str:
@@ -43,8 +48,148 @@ def split_sentences(text: str) -> list[str]:
     return [part.strip() for part in parts if str(part).strip()]
 
 
+def _get_file_extension(file_name: str) -> str:
+    """读取文件扩展名，统一转为小写。"""
+    name = str(file_name or "").strip().lower()
+    dot_index = name.rfind(".")
+    return name[dot_index:] if dot_index >= 0 else ""
+
+
+def _decode_text_bytes(raw_bytes: bytes) -> str:
+    """兼容 UTF-8/UTF-16/GBK 文本文档。"""
+    for encoding in ("utf-8-sig", "utf-16", "utf-16le", "gb18030"):
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("utf-8", errors="ignore")
+
+
+def _strip_markdown(text: str) -> str:
+    """将 Markdown 标记压成适合主题抽取的纯文本。"""
+    clean = re.sub(r"```[\s\S]*?```", " ", text)
+    clean = re.sub(r"`([^`]*)`", r"\1", clean)
+    clean = re.sub(r"!\[[^\]]*]\([^)]*\)", " ", clean)
+    clean = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", clean)
+    clean = re.sub(r"^\s{0,3}#{1,6}\s*", "", clean, flags=re.MULTILINE)
+    clean = re.sub(r"^\s{0,3}[-*+]\s+", "", clean, flags=re.MULTILINE)
+    clean = re.sub(r"^\s{0,3}\d+[.)]\s+", "", clean, flags=re.MULTILINE)
+    clean = re.sub(r"[*_~>#|]", " ", clean)
+    return clean
+
+
+def _extract_docx_text(raw_bytes: bytes) -> str:
+    """从 docx OOXML 中提取段落和表格文本。"""
+    try:
+        with zipfile.ZipFile(BytesIO(raw_bytes)) as archive:
+            xml_text = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError("Word .docx 文件解析失败，请确认文件未损坏") from exc
+
+    paragraph_xml_list = re.findall(r"<w:p[\s\S]*?</w:p>", xml_text)
+    paragraphs = []
+    for paragraph_xml in paragraph_xml_list:
+        text_parts = re.findall(r"<w:t[^>]*>([\s\S]*?)</w:t>", paragraph_xml)
+        text = "".join(html.unescape(part) for part in text_parts).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
+def _extract_legacy_doc_text(raw_bytes: bytes) -> str:
+    """尽量从旧版 .doc 二进制中提取可读文本；复杂格式建议另存为 docx。"""
+    utf16_text = raw_bytes.decode("utf-16le", errors="ignore")
+    ascii_text = raw_bytes.decode("latin1", errors="ignore")
+    candidates = re.findall(r"[\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:（）()《》“”\"'\-\s]{4,}", utf16_text)
+    if len("".join(candidates)) < 30:
+        candidates = re.findall(r"[\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:（）()《》“”\"'\-\s]{4,}", ascii_text)
+    clean_lines = []
+    for item in candidates:
+        line = re.sub(r"\s+", " ", item).strip()
+        if len(line) >= 2:
+            clean_lines.append(line)
+    return "\n".join(clean_lines)
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    """从 PDF 页面中提取文本，扫描件 PDF 需要 OCR 后再上传。"""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise ValueError("后端缺少 pypdf 依赖，无法解析 PDF，请先安装 requirements.txt") from exc
+
+    try:
+        reader = PdfReader(BytesIO(raw_bytes))
+    except Exception as exc:
+        raise ValueError("PDF 文件解析失败，请确认文件未损坏或未加密") from exc
+
+    page_texts = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text.strip():
+            page_texts.append(page_text.strip())
+    return "\n\n".join(page_texts)
+
+
+def extract_text_from_document_payload(file_payload: dict) -> tuple[str, str]:
+    """解析前端传入的文件载荷，返回文件名和纯文本内容。"""
+    if not isinstance(file_payload, dict):
+        raise ValueError("文件载荷格式错误")
+
+    file_name = str(file_payload.get("name", "") or "").strip()
+    extension = _get_file_extension(file_name)
+    if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
+        raise ValueError(f"{file_name or '未命名文件'} 格式不支持，仅支持 txt、md、doc、docx、pdf")
+
+    content_base64 = str(file_payload.get("content_base64", "") or "")
+    if content_base64:
+        try:
+            raw_bytes = base64.b64decode(content_base64)
+        except ValueError as exc:
+            raise ValueError(f"{file_name} 文件编码无效") from exc
+    else:
+        raw_text = str(file_payload.get("text", "") or "")
+        raw_bytes = raw_text.encode("utf-8")
+
+    if extension in {".txt"}:
+        text = _decode_text_bytes(raw_bytes)
+    elif extension in {".md", ".markdown"}:
+        text = _strip_markdown(_decode_text_bytes(raw_bytes))
+    elif extension == ".docx":
+        text = _extract_docx_text(raw_bytes)
+    elif extension == ".pdf":
+        text = _extract_pdf_text(raw_bytes)
+    else:
+        text = _extract_legacy_doc_text(raw_bytes)
+
+    normalized_text = re.sub(r"\r\n?", "\n", text).strip()
+    if not normalized_text:
+        raise ValueError(f"{file_name} 未解析到有效正文")
+    return file_name, normalized_text
+
+
 def parse_extract_texts(request_data: dict):
     """解析 /extract 的文本输入，保持现有兼容行为。"""
+    if isinstance(request_data.get("files"), list):
+        texts = []
+        file_names = []
+        errors = []
+        for index, file_payload in enumerate(request_data.get("files") or [], start=1):
+            try:
+                file_name, text = extract_text_from_document_payload(file_payload)
+                texts.append(text)
+                file_names.append(file_name or f"文档{index}")
+            except ValueError as exc:
+                errors.append(str(exc))
+        if errors:
+            return None, "；".join(errors)
+        if not texts:
+            return None, "参数错误：文件内容不能为空"
+        request_data["file_names"] = file_names
+        return texts, None
     if "text" in request_data:
         return [request_data["text"]], None
     if "texts" in request_data and isinstance(request_data["texts"], list):
