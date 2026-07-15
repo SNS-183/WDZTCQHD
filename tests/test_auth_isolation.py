@@ -19,6 +19,7 @@ def _install_dependency_fakes():
 
     database = types.ModuleType("database")
     database.TASK_STATUS_ERROR = "失败"
+    database.TASK_STATUS_DONE = "已完成"
     for name in (
         "clear_task_history",
         "create_analysis_task_record",
@@ -26,15 +27,25 @@ def _install_dependency_fakes():
         "delete_task_by_id",
         "fetch_task_detail",
         "fetch_recent_files",
+        "fetch_task_summary",
         "find_user_by_username",
         "find_user_id_by_username",
         "find_existing_document_names",
+        "find_task_by_request_id",
         "init_database",
         "save_extract_result",
         "save_wordcloud_result",
         "update_analysis_task_status",
     ):
         setattr(database, name, Mock())
+
+    database.fetch_task_summary.return_value = {
+        "total_count": 0,
+        "done_count": 0,
+        "running_count": 0,
+        "error_count": 0,
+        "document_count": 0,
+    }
 
     sys.modules["app_logic"] = app_logic
     sys.modules["database"] = database
@@ -209,6 +220,7 @@ class AuthIsolationTest(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_code)
+        self.assertEqual(11, response.get_json()["data"]["task_id"])
         request_payload = self.database.create_analysis_task_record.call_args.args[0]
         self.assertNotIn("username", request_payload)
         self.assertEqual(
@@ -216,6 +228,34 @@ class AuthIsolationTest(unittest.TestCase):
             self.database.create_analysis_task_record.call_args.kwargs["user_id"],
         )
         self.assertEqual(7, self.database.save_extract_result.call_args.kwargs["user_id"])
+
+    def test_extract_replays_completed_idempotent_request_without_creating_batch(self):
+        """同一用户重复提交幂等键时直接复用已完成结果。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.find_task_by_request_id.return_value = {
+            "task_id": 11,
+            "task_status": "已完成",
+            "response_payload": {"code": 200, "msg": "成功", "data": {"themes": []}},
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post(
+            "/extract",
+            json={"text": "测试文档内容", "request_id": "request-001", "record_recent": True},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(11, response.get_json()["data"]["task_id"])
+        self.database.find_task_by_request_id.assert_called_once_with(7, "request-001")
+        self.database.create_analysis_task_record.assert_not_called()
+        self.app_logic.build_extract_result.assert_not_called()
 
 
 if __name__ == "__main__":

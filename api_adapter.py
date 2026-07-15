@@ -1,6 +1,7 @@
 from flask import Flask, g, jsonify, request, session
 from flask_cors import CORS
 from functools import wraps
+import json
 import logging
 import os
 import secrets
@@ -25,14 +26,32 @@ from database import (
     delete_task_by_id,
     fetch_task_detail,
     fetch_recent_files,
+    fetch_task_summary,
     find_user_by_username,
     find_existing_document_names,
+    find_task_by_request_id,
     init_database,
     save_extract_result,
     save_wordcloud_result,
     update_analysis_task_status,
     TASK_STATUS_ERROR,
+    TASK_STATUS_DONE,
 )
+
+
+class JsonLogFormatter(logging.Formatter):
+    """将服务日志输出为便于采集的单行 JSON。"""
+
+    def format(self, record):
+        payload = {
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
 
 
 app = Flask(__name__)
@@ -42,6 +61,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
+    MAX_CONTENT_LENGTH=int(os.getenv("MAX_REQUEST_BYTES", str(32 * 1024 * 1024))),
 )
 
 # 仅允许配置中的前端地址携带会话 Cookie，避免开放跨域读取用户数据。
@@ -55,11 +75,28 @@ cors_origins = [
 ]
 CORS(app, origins=cors_origins, supports_credentials=True)
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+# 配置结构化日志，生产环境可直接交给日志采集器处理。
+log_handler = logging.StreamHandler()
+log_handler.setFormatter(JsonLogFormatter())
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    handlers=[log_handler],
+)
 logger = logging.getLogger(__name__)
 
 MAX_RECENT = 20
+
+
+@app.errorhandler(413)
+def handle_request_too_large(_error):
+    """用统一 JSON 格式返回请求体超限错误。"""
+    return jsonify({"code": 413, "msg": "请求体过大，请减少文件数量或文件大小"}), 413
+
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    """供负载均衡与进程守护探测服务存活状态。"""
+    return jsonify({"code": 200, "msg": "服务正常", "data": {"status": "ok"}}), 200
 
 
 def login_required(view_func):
@@ -233,6 +270,28 @@ def extract_interests():
         if not isinstance(record_recent, bool):
             return jsonify({"code": 400, "msg": "参数错误：record_recent 必须为布尔值"}), 400
 
+        request_id = str(request_data.get("request_id", "") or "").strip()
+        if request_id and (len(request_id) > 64 or not all(ch.isalnum() or ch in "-_.:" for ch in request_id)):
+            return jsonify({"code": 400, "msg": "参数错误：request_id 格式无效"}), 400
+        if record_recent and request_id:
+            existing_task = find_task_by_request_id(g.current_user_id, request_id)
+            if existing_task:
+                if existing_task["task_status"] == TASK_STATUS_DONE and isinstance(
+                    existing_task.get("response_payload"), dict
+                ):
+                    # 已完成请求直接返回快照，并补齐历史快照中可能缺失的批次 ID。
+                    replay_response = dict(existing_task["response_payload"])
+                    replay_data = dict(replay_response.get("data") or {})
+                    replay_data["task_id"] = existing_task["task_id"]
+                    replay_data["batch_id"] = existing_task["task_id"]
+                    replay_response["data"] = replay_data
+                    return jsonify(replay_response), 200
+                return jsonify({
+                    "code": 409,
+                    "msg": "相同请求已提交，当前状态：" + existing_task["task_status"],
+                    "data": {"task_id": existing_task["task_id"]},
+                }), 409
+
         file_names, err_msg = parse_request_file_names(request_data, len(texts))
         if err_msg:
             return jsonify({"code": 400, "msg": err_msg}), 400
@@ -323,10 +382,11 @@ def extract_interests():
                 existing_task_id=pending_task_id,
             )
             if isinstance(saved_task, dict):
-                # 前端需要用本次保存的文档主键回读整批结果，避免再用“最新任务”误命中旧数据。
+                # 对外只返回分析批次 ID，文档主键保留在 saved_task 内部明细中。
                 response_data["data"]["saved_task"] = saved_task
-                response_data["data"]["task_id"] = saved_task.get("task_id")
-                response_data["data"]["batch_id"] = saved_task.get("batch_id")
+                batch_id = saved_task.get("batch_id") or saved_task.get("task_id")
+                response_data["data"]["task_id"] = batch_id
+                response_data["data"]["batch_id"] = batch_id
 
         logger.info(f"请求处理完成，总共提取到 {total_theme_count} 个主题")
         return jsonify(response_data), 200
@@ -351,6 +411,7 @@ def get_recent_docs():
             "code": 200,
             "msg": "获取成功",
             "data": fetch_recent_files(g.current_user_id, MAX_RECENT),
+            "summary": fetch_task_summary(g.current_user_id),
         }), 200
     except Exception as exc:
         logger.error(f"获取 recent-docs 错误: {str(exc)}")
@@ -403,4 +464,8 @@ if __name__ == "__main__":
         logger.info("MySQL 数据库初始化完成")
     except Exception as exc:
         logger.error(f"MySQL 数据库初始化失败: {str(exc)}")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host=os.getenv("APP_HOST", "127.0.0.1"),
+        port=int(os.getenv("APP_PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+    )

@@ -18,6 +18,17 @@ $env:CORS_ORIGINS = 'http://127.0.0.1:5173,http://localhost:5173'
 python api_adapter.py
 ```
 
+生产环境请使用 Waitress 启动，Flask Debug 默认关闭：
+
+```powershell
+$env:APP_SECRET_KEY = '请设置足够长的随机密钥'
+waitress-serve --host=127.0.0.1 --port=5000 api_adapter:app
+```
+
+可通过 `GET /api/health` 执行存活探测。上传边界可用
+`MAX_REQUEST_BYTES`、`MAX_EXTRACT_FILE_COUNT`、`MAX_SINGLE_FILE_BYTES`、
+`MAX_TOTAL_TEXT_CHARS`、`MAX_PDF_PAGE_COUNT` 和 `MAX_DOCX_UNCOMPRESSED_BYTES` 调整。
+
 ## 会话与数据隔离
 
 - 登录成功后由 Flask 签名 Cookie 保存会话，前端请求必须携带 `credentials: include`。

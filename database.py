@@ -90,11 +90,13 @@ def init_database():
                     task_status VARCHAR(32) NOT NULL DEFAULT '已完成',
                     create_time DATETIME NOT NULL,
                     user_id BIGINT NULL,
+                    request_id VARCHAR(64) NULL,
                     request_payload_json JSON NULL,
                     response_payload_json JSON NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_analysis_tasks_create_time (create_time),
                     INDEX idx_analysis_tasks_user_id (user_id),
+                    UNIQUE KEY uk_analysis_tasks_user_request (user_id, request_id),
                     CONSTRAINT fk_analysis_tasks_user
                         FOREIGN KEY (user_id) REFERENCES users(user_id)
                         ON DELETE SET NULL
@@ -217,6 +219,20 @@ def init_database():
                 cursor.execute(
                     "ALTER TABLE analysis_tasks ADD COLUMN task_status VARCHAR(32) NOT NULL DEFAULT '已完成' AFTER theme_count"
                 )
+            # 兼容旧库：幂等键按用户唯一，NULL 仍允许历史任务共存。
+            cursor.execute("SHOW COLUMNS FROM analysis_tasks LIKE 'request_id'")
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "ALTER TABLE analysis_tasks ADD COLUMN request_id VARCHAR(64) NULL AFTER user_id"
+                )
+            cursor.execute(
+                "SHOW INDEX FROM analysis_tasks WHERE Key_name = 'uk_analysis_tasks_user_request'"
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "ALTER TABLE analysis_tasks ADD UNIQUE KEY "
+                    "uk_analysis_tasks_user_request (user_id, request_id)"
+                )
         connection.commit()
     _db_initialized = True
 
@@ -264,6 +280,7 @@ def create_analysis_task_record(
             file_count = len(request_payload.get("texts"))
         elif request_payload.get("text"):
             file_count = 1
+    request_id = str((request_payload or {}).get("request_id", "") or "").strip() or None
 
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
@@ -271,8 +288,8 @@ def create_analysis_task_record(
                 """
                 INSERT INTO analysis_tasks (
                     task_name, file_count, theme_count, task_status,
-                    create_time, user_id, request_payload_json, response_payload_json
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    create_time, user_id, request_id, request_payload_json, response_payload_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     task_name,
@@ -281,6 +298,7 @@ def create_analysis_task_record(
                     status,
                     now,
                     user_id,
+                    request_id,
                     json.dumps(request_payload or {}, ensure_ascii=False),
                     None,
                 ),
@@ -354,12 +372,13 @@ def _insert_normalized_extract_result(
             ),
         )
     else:
+        request_id = str((request_payload or {}).get("request_id", "") or "").strip() or None
         cursor.execute(
             """
             INSERT INTO analysis_tasks (
                 task_name, file_count, theme_count, task_status,
-                create_time, user_id, request_payload_json, response_payload_json
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                create_time, user_id, request_id, request_payload_json, response_payload_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 task_name,
@@ -368,6 +387,7 @@ def _insert_normalized_extract_result(
                 TASK_STATUS_DONE,
                 now,
                 user_id,
+                request_id,
                 json.dumps(request_payload or {}, ensure_ascii=False),
                 json.dumps(response_payload or {}, ensure_ascii=False),
             ),
@@ -480,7 +500,8 @@ def _insert_normalized_extract_result(
     return {
         "batch_id": task_id,
         "document_task_ids": saved_document_ids,
-        "task_id": saved_document_ids[0] if saved_document_ids else None,
+        "task_id": task_id,
+        "selected_document_id": saved_document_ids[0] if saved_document_ids else None,
     }
 
 
@@ -550,19 +571,25 @@ def fetch_recent_files(user_id: int, limit: int = 20) -> list[dict]:
         with connection.cursor() as cursor:
             base_sql = """
                 SELECT
-                    COALESCE(di.document_id, at.task_id) AS task_id,
+                    at.task_id,
                     at.task_id AS batch_id,
-                    COALESCE(di.document_source_id, '') AS id,
-                    COALESCE(di.document_name, at.task_name) AS name,
-                    COALESCE(di.document_index, 0) AS `index`,
-                    COALESCE(di.word_count, 0) AS word_count,
-                    COALESCE(di.sentence_count, 0) AS sentence_count,
-                    COALESCE(di.language, '') AS language,
-                    DATE_FORMAT(COALESCE(di.upload_time, at.create_time), '%%Y-%%m-%%d %%H:%%i:%%s') AS upload_time,
+                    at.task_id AS id,
+                    at.task_name AS name,
+                    0 AS `index`,
+                    COALESCE(SUM(di.word_count), 0) AS word_count,
+                    COALESCE(SUM(di.sentence_count), 0) AS sentence_count,
+                    COALESCE(
+                        GROUP_CONCAT(DISTINCT NULLIF(di.language, '') ORDER BY di.language SEPARATOR '/'),
+                        ''
+                    ) AS language,
+                    DATE_FORMAT(
+                        COALESCE(MAX(di.upload_time), at.create_time),
+                        '%%Y-%%m-%%d %%H:%%i:%%s'
+                    ) AS upload_time,
                     at.task_name,
                     at.file_count AS doc_count,
                     at.task_status AS status,
-                    at.task_status
+                    at.task_status AS task_status
                 FROM analysis_tasks at
                 LEFT JOIN document_info di ON di.task_id = at.task_id
             """
@@ -570,12 +597,42 @@ def fetch_recent_files(user_id: int, limit: int = 20) -> list[dict]:
                 base_sql
                 + """
                 WHERE at.user_id = %s
-                ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
+                GROUP BY at.task_id, at.task_name, at.file_count, at.task_status, at.create_time
+                ORDER BY COALESCE(MAX(di.upload_time), at.create_time) DESC, at.task_id DESC
                 LIMIT %s
                 """,
                 (int(user_id), int(limit)),
             )
             return list(cursor.fetchall())
+
+
+def fetch_task_summary(user_id: int) -> dict:
+    """按批次统计当前用户全部任务，避免列表截断影响统计口径。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_count,
+                    SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS done_count,
+                    SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS running_count,
+                    SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS error_count,
+                    COALESCE(SUM(file_count), 0) AS document_count
+                FROM analysis_tasks
+                WHERE user_id = %s
+                """,
+                (TASK_STATUS_DONE, TASK_STATUS_RUNNING, TASK_STATUS_ERROR, int(user_id)),
+            )
+            row = cursor.fetchone() or {}
+            return {
+                "total_count": int(row.get("total_count", 0) or 0),
+                "done_count": int(row.get("done_count", 0) or 0),
+                "running_count": int(row.get("running_count", 0) or 0),
+                "error_count": int(row.get("error_count", 0) or 0),
+                "document_count": int(row.get("document_count", 0) or 0),
+            }
 
 
 def _parse_json_field(value, default):
@@ -590,6 +647,31 @@ def _parse_json_field(value, default):
         except json.JSONDecodeError:
             return default
     return default
+
+
+def find_task_by_request_id(user_id: int, request_id: str):
+    """按当前用户和幂等键读取已有批次，防止超时重试重复写入。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT task_id, task_status, response_payload_json
+                FROM analysis_tasks
+                WHERE user_id = %s AND request_id = %s
+                LIMIT 1
+                """,
+                (int(user_id), str(request_id)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "task_id": int(row["task_id"]),
+                "task_status": str(row.get("task_status", "")),
+                "response_payload": _parse_json_field(row.get("response_payload_json"), {}),
+            }
 
 
 def _delete_orphan_keywords(cursor):
@@ -612,10 +694,8 @@ def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
             cursor.execute(
                 """
                 SELECT
-                    di.document_id AS task_id,
-                    di.task_id AS batch_id,
-                    di.document_source_id AS file_id,
-                    di.document_index AS file_index,
+                    at.task_id,
+                    at.task_id AS batch_id,
                     at.file_count AS batch_file_count,
                     at.theme_count AS batch_theme_count,
                     at.task_status,
@@ -623,10 +703,9 @@ def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
                     ts.doc_theme_count AS batch_doc_theme_count,
                     ts.processing_time_ms,
                     ts.algorithm_version
-                FROM document_info di
-                INNER JOIN analysis_tasks at ON at.task_id = di.task_id
+                FROM analysis_tasks at
                 LEFT JOIN task_statistics ts ON ts.task_id = at.task_id
-                WHERE di.document_id = %s
+                WHERE at.task_id = %s
                   AND at.user_id = %s
                 LIMIT 1
                 """,
@@ -688,9 +767,9 @@ def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
 
             data["files"] = files
             data["file_count"] = len(files)
-            data["selected_task_id"] = int(batch_row["task_id"])
-            data["selected_file_id"] = str(batch_row["file_id"])
-            data["selected_file_index"] = int(batch_row["file_index"])
+            data["selected_task_id"] = normalized_task_id
+            data["selected_file_id"] = str(files[0]["id"]) if files else ""
+            data["selected_file_index"] = int(files[0]["index"]) if files else 0
             data["batch_id"] = normalized_task_id
 
             statistics = data.get("statistics")
@@ -714,41 +793,27 @@ def delete_task_by_id(task_id: int, user_id: int) -> bool:
     settings = get_db_settings()
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
-            # 先按文档 ID 查批次，失败/分析中的任务可能还没有文档行。
             cursor.execute(
                 """
-                SELECT at.task_id, at.user_id
-                FROM document_info di
-                INNER JOIN analysis_tasks at ON at.task_id = di.task_id
-                WHERE di.document_id = %s
-                  AND at.user_id = %s
+                SELECT task_id, user_id
+                FROM analysis_tasks
+                WHERE task_id = %s
+                  AND user_id = %s
                 LIMIT 1
                 """,
                 (int(task_id), int(user_id)),
             )
             row = cursor.fetchone()
             if not row:
-                cursor.execute(
-                    """
-                    SELECT task_id, user_id
-                    FROM analysis_tasks
-                    WHERE task_id = %s
-                      AND user_id = %s
-                    LIMIT 1
-                    """,
-                    (int(task_id), int(user_id)),
-                )
-                row = cursor.fetchone()
-            if not row:
                 return False
 
             normalized_task_id = int(row["task_id"])
 
-            # 级联删除：document_info 的 FK ON DELETE CASCADE 会清理 topic_info
-            cursor.execute("DELETE FROM document_info WHERE task_id = %s", (normalized_task_id,))
-
-            # 清理分析任务和统计
-            cursor.execute("DELETE FROM analysis_tasks WHERE task_id = %s", (normalized_task_id,))
+            # 删除批次后由外键级联清理文档、主题、关键词关系和统计。
+            cursor.execute(
+                "DELETE FROM analysis_tasks WHERE task_id = %s AND user_id = %s",
+                (normalized_task_id, int(user_id)),
+            )
 
             # 删除孤立关键词
             _delete_orphan_keywords(cursor)

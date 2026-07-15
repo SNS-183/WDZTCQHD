@@ -1,6 +1,8 @@
 import base64
+import binascii
 import html
 import logging
+import os
 import re
 import time
 import zipfile
@@ -28,6 +30,12 @@ CN_STOP = set(
 ALLOWED_POS = {"n", "nt", "nz", "vn", "v", "eng"}
 GENERIC_THEME_SUFFIXES = ["主题", "治理", "服务", "发展"]
 SUPPORTED_DOCUMENT_EXTENSIONS = {".txt", ".md", ".markdown", ".docx", ".doc", ".pdf"}
+MAX_EXTRACT_FILE_COUNT = int(os.getenv("MAX_EXTRACT_FILE_COUNT", "20"))
+MAX_SINGLE_FILE_BYTES = int(os.getenv("MAX_SINGLE_FILE_BYTES", str(10 * 1024 * 1024)))
+MAX_TOTAL_TEXT_CHARS = int(os.getenv("MAX_TOTAL_TEXT_CHARS", "5000000"))
+MAX_DOCX_ENTRY_COUNT = int(os.getenv("MAX_DOCX_ENTRY_COUNT", "2000"))
+MAX_DOCX_UNCOMPRESSED_BYTES = int(os.getenv("MAX_DOCX_UNCOMPRESSED_BYTES", str(50 * 1024 * 1024)))
+MAX_PDF_PAGE_COUNT = int(os.getenv("MAX_PDF_PAGE_COUNT", "200"))
 
 
 def guess_language(text: str) -> str:
@@ -82,7 +90,15 @@ def _extract_docx_text(raw_bytes: bytes) -> str:
     """从 docx OOXML 中提取段落和表格文本。"""
     try:
         with zipfile.ZipFile(BytesIO(raw_bytes)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_DOCX_ENTRY_COUNT:
+                raise ValueError(f"Word .docx 压缩包条目不能超过 {MAX_DOCX_ENTRY_COUNT} 个")
+            uncompressed_size = sum(max(int(entry.file_size), 0) for entry in entries)
+            if uncompressed_size > MAX_DOCX_UNCOMPRESSED_BYTES:
+                raise ValueError("Word .docx 解压后内容过大")
             xml_text = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+    except ValueError:
+        raise
     except (KeyError, zipfile.BadZipFile) as exc:
         raise ValueError("Word .docx 文件解析失败，请确认文件未损坏") from exc
 
@@ -123,6 +139,11 @@ def _extract_pdf_text(raw_bytes: bytes) -> str:
     except Exception as exc:
         raise ValueError("PDF 文件解析失败，请确认文件未损坏或未加密") from exc
 
+    if getattr(reader, "is_encrypted", False):
+        raise ValueError("PDF 文件已加密，请解密后重新上传")
+    if len(reader.pages) > MAX_PDF_PAGE_COUNT:
+        raise ValueError(f"PDF 页数不能超过 {MAX_PDF_PAGE_COUNT} 页")
+
     page_texts = []
     for page in reader.pages:
         try:
@@ -146,13 +167,23 @@ def extract_text_from_document_payload(file_payload: dict) -> tuple[str, str]:
 
     content_base64 = str(file_payload.get("content_base64", "") or "")
     if content_base64:
+        estimated_bytes = (len(content_base64) * 3) // 4
+        if estimated_bytes > MAX_SINGLE_FILE_BYTES:
+            raise ValueError(
+                f"{file_name} 文件大小不能超过 {MAX_SINGLE_FILE_BYTES // (1024 * 1024)} MB"
+            )
         try:
-            raw_bytes = base64.b64decode(content_base64)
-        except ValueError as exc:
+            raw_bytes = base64.b64decode(content_base64, validate=True)
+        except (ValueError, binascii.Error) as exc:
             raise ValueError(f"{file_name} 文件编码无效") from exc
     else:
         raw_text = str(file_payload.get("text", "") or "")
         raw_bytes = raw_text.encode("utf-8")
+
+    if len(raw_bytes) > MAX_SINGLE_FILE_BYTES:
+        raise ValueError(
+            f"{file_name} 文件大小不能超过 {MAX_SINGLE_FILE_BYTES // (1024 * 1024)} MB"
+        )
 
     if extension in {".txt"}:
         text = _decode_text_bytes(raw_bytes)
@@ -174,10 +205,13 @@ def extract_text_from_document_payload(file_payload: dict) -> tuple[str, str]:
 def parse_extract_texts(request_data: dict):
     """解析 /extract 的文本输入，保持现有兼容行为。"""
     if isinstance(request_data.get("files"), list):
+        file_payloads = request_data.get("files") or []
+        if len(file_payloads) > MAX_EXTRACT_FILE_COUNT:
+            return None, f"参数错误：文件数量不能超过 {MAX_EXTRACT_FILE_COUNT} 个"
         texts = []
         file_names = []
         errors = []
-        for index, file_payload in enumerate(request_data.get("files") or [], start=1):
+        for index, file_payload in enumerate(file_payloads, start=1):
             try:
                 file_name, text = extract_text_from_document_payload(file_payload)
                 texts.append(text)
@@ -188,14 +222,23 @@ def parse_extract_texts(request_data: dict):
             return None, "；".join(errors)
         if not texts:
             return None, "参数错误：文件内容不能为空"
+        if sum(len(text) for text in texts) > MAX_TOTAL_TEXT_CHARS:
+            return None, f"参数错误：文本总长度不能超过 {MAX_TOTAL_TEXT_CHARS} 个字符"
         request_data["file_names"] = file_names
         return texts, None
     if "text" in request_data:
-        return [request_data["text"]], None
+        text = str(request_data["text"] or "")
+        if len(text) > MAX_TOTAL_TEXT_CHARS:
+            return None, f"参数错误：文本总长度不能超过 {MAX_TOTAL_TEXT_CHARS} 个字符"
+        return [text], None
     if "texts" in request_data and isinstance(request_data["texts"], list):
         texts = request_data["texts"]
         if not texts:
             return None, "参数错误：文本内容不能为空"
+        if len(texts) > MAX_EXTRACT_FILE_COUNT:
+            return None, f"参数错误：文本数量不能超过 {MAX_EXTRACT_FILE_COUNT} 个"
+        if sum(len(str(text or "")) for text in texts) > MAX_TOTAL_TEXT_CHARS:
+            return None, f"参数错误：文本总长度不能超过 {MAX_TOTAL_TEXT_CHARS} 个字符"
         return texts, None
     return None, "参数错误：请提供 'text' 字段或 'texts' 数组"
 

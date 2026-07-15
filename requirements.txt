@@ -6,3 +6,4 @@ jieba==0.42.1
 pymysql==1.1.2
 cryptography==47.0.0
 pypdf
+waitress==3.0.2
