@@ -515,8 +515,8 @@ def save_wordcloud_result(request_payload: dict, response_payload: dict):
     pass  # 词云数据已存储在新表的 response_payload_json 中
 
 
-def find_existing_document_names(file_names: list[str]) -> list[str]:
-    """检查文档名是否已被历史抽取任务使用。"""
+def find_existing_document_names(file_names: list[str], user_id: int) -> list[str]:
+    """只在当前用户的历史任务中检查重复文档名。"""
     clean_names = sorted({str(name).strip() for name in file_names if str(name).strip()})
     if not clean_names:
         return []
@@ -529,24 +529,22 @@ def find_existing_document_names(file_names: list[str]) -> list[str]:
             existed_names = set()
             cursor.execute(
                 f"""
-                SELECT document_name AS name
-                FROM document_info
-                WHERE document_name IN ({placeholders})
+                SELECT di.document_name AS name
+                FROM document_info di
+                INNER JOIN analysis_tasks at ON at.task_id = di.task_id
+                WHERE at.user_id = %s
+                  AND di.document_name IN ({placeholders})
                 """,
-                tuple(clean_names),
+                (int(user_id), *clean_names),
             )
             existed_names.update(str(row.get("name", "")) for row in cursor.fetchall())
     return [name for name in clean_names if name in existed_names]
 
 
-def fetch_recent_files(username: str | None = None, limit: int = 20) -> list[dict]:
+def fetch_recent_files(user_id: int, limit: int = 20) -> list[dict]:
     """读取当前用户任务列表，包含已完成文档以及失败/分析中的批次记录。"""
     ensure_database_ready()
     settings = get_db_settings()
-
-    user_id = None
-    if username:
-        user_id = find_user_id_by_username(username)
 
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
@@ -568,25 +566,15 @@ def fetch_recent_files(username: str | None = None, limit: int = 20) -> list[dic
                 FROM analysis_tasks at
                 LEFT JOIN document_info di ON di.task_id = at.task_id
             """
-            if user_id:
-                cursor.execute(
-                    base_sql
-                    + """
-                    WHERE at.user_id = %s
-                    ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
-                    LIMIT %s
-                    """,
-                    (user_id, int(limit)),
-                )
-            else:
-                cursor.execute(
-                    base_sql
-                    + """
-                    ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
-                    LIMIT %s
-                    """,
-                    (int(limit),),
-                )
+            cursor.execute(
+                base_sql
+                + """
+                WHERE at.user_id = %s
+                ORDER BY COALESCE(di.upload_time, at.create_time) DESC, at.task_id DESC, di.document_id DESC
+                LIMIT %s
+                """,
+                (int(user_id), int(limit)),
+            )
             return list(cursor.fetchall())
 
 
@@ -615,8 +603,8 @@ def _delete_orphan_keywords(cursor):
     )
 
 
-def fetch_task_detail(task_id: int) -> dict | None:
-    """按任务主键读取整批分析结果。"""
+def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
+    """按任务主键读取当前用户的整批分析结果。"""
     ensure_database_ready()
     settings = get_db_settings()
     with get_connection(settings["database"]) as connection:
@@ -639,9 +627,10 @@ def fetch_task_detail(task_id: int) -> dict | None:
                 INNER JOIN analysis_tasks at ON at.task_id = di.task_id
                 LEFT JOIN task_statistics ts ON ts.task_id = at.task_id
                 WHERE di.document_id = %s
+                  AND at.user_id = %s
                 LIMIT 1
                 """,
-                (int(task_id),),
+                (int(task_id), int(user_id)),
             )
             normalized_row = cursor.fetchone()
             if not normalized_row:
@@ -719,7 +708,7 @@ def fetch_task_detail(task_id: int) -> dict | None:
             return response_data
 
 
-def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
+def delete_task_by_id(task_id: int, user_id: int) -> bool:
     """按文档任务 ID 或批次 ID 删除，验证用户所有权。"""
     ensure_database_ready()
     settings = get_db_settings()
@@ -732,9 +721,10 @@ def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
                 FROM document_info di
                 INNER JOIN analysis_tasks at ON at.task_id = di.task_id
                 WHERE di.document_id = %s
+                  AND at.user_id = %s
                 LIMIT 1
                 """,
-                (int(task_id),),
+                (int(task_id), int(user_id)),
             )
             row = cursor.fetchone()
             if not row:
@@ -743,19 +733,14 @@ def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
                     SELECT task_id, user_id
                     FROM analysis_tasks
                     WHERE task_id = %s
+                      AND user_id = %s
                     LIMIT 1
                     """,
-                    (int(task_id),),
+                    (int(task_id), int(user_id)),
                 )
                 row = cursor.fetchone()
             if not row:
                 return False
-
-            if username:
-                uid = find_user_id_by_username(username)
-                task_uid = int(row.get("user_id") or 0)
-                if not uid or task_uid != uid:
-                    return False
 
             normalized_task_id = int(row["task_id"])
 
@@ -772,24 +757,23 @@ def delete_task_by_id(task_id: int, username: str | None = None) -> bool:
         return True
 
 
-def clear_task_history(username: str | None = None) -> dict:
+def clear_task_history(user_id: int) -> dict:
     """清空指定用户的任务列表数据。"""
     ensure_database_ready()
     settings = get_db_settings()
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
-            if username:
-                uid = find_user_id_by_username(username)
-                if not uid:
-                    return {"batch_count": 0, "file_count": 0, "theme_count": 0}
-                cursor.execute("SELECT COUNT(*) AS count FROM analysis_tasks WHERE user_id = %s", (uid,))
-                batch_count = int((cursor.fetchone() or {}).get("count", 0))
-                cursor.execute("DELETE FROM analysis_tasks WHERE user_id = %s", (uid,))
-            else:
-                cursor.execute("SELECT COUNT(*) AS count FROM analysis_tasks")
-                batch_count = int((cursor.fetchone() or {}).get("count", 0))
-                cursor.execute("DELETE FROM analysis_tasks")
-            cursor.execute("DELETE FROM keyword_info")
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM analysis_tasks WHERE user_id = %s",
+                (int(user_id),),
+            )
+            batch_count = int((cursor.fetchone() or {}).get("count", 0))
+            cursor.execute(
+                "DELETE FROM analysis_tasks WHERE user_id = %s",
+                (int(user_id),),
+            )
+            # 只清理由当前用户任务删除后留下的孤立关键词，不影响其他用户仍在使用的关键词。
+            _delete_orphan_keywords(cursor)
         connection.commit()
         return {"batch_count": batch_count, "file_count": 0, "theme_count": 0}
 

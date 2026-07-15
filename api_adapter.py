@@ -1,6 +1,9 @@
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request, session
 from flask_cors import CORS
+from functools import wraps
 import logging
+import os
+import secrets
 import time
 
 import pymysql
@@ -23,7 +26,6 @@ from database import (
     fetch_task_detail,
     fetch_recent_files,
     find_user_by_username,
-    find_user_id_by_username,
     find_existing_document_names,
     init_database,
     save_extract_result,
@@ -34,13 +36,47 @@ from database import (
 
 
 app = Flask(__name__)
-CORS(app)
+secret_key = os.getenv("APP_SECRET_KEY") or secrets.token_hex(32)
+app.config.update(
+    SECRET_KEY=secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
+)
+
+# 仅允许配置中的前端地址携带会话 Cookie，避免开放跨域读取用户数据。
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5175,http://localhost:5175",
+    ).split(",")
+    if origin.strip()
+]
+CORS(app, origins=cors_origins, supports_credentials=True)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_RECENT = 20
+
+
+def login_required(view_func):
+    """要求请求携带有效登录会话，并向当前请求注入用户上下文。"""
+
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return view_func(*args, **kwargs)
+        user_id = session.get("user_id")
+        if not user_id:
+            return jsonify({"code": 401, "msg": "登录状态已失效，请重新登录"}), 401
+        g.current_user_id = int(user_id)
+        g.current_username = str(session.get("username", "") or "")
+        return view_func(*args, **kwargs)
+
+    return wrapped
 
 
 def _parse_auth_payload():
@@ -104,6 +140,10 @@ def login_user():
         if user is None or not check_password_hash(user["password_hash"], password):
             return jsonify({"code": 401, "msg": "用户名或密码错误"}), 401
 
+        # 登录成功后只在服务端签名会话中保存身份，后续不再信任客户端自报用户名。
+        session.clear()
+        session["user_id"] = int(user["user_id"])
+        session["username"] = str(user["username"])
         return jsonify({
             "code": 200,
             "msg": "登录成功",
@@ -117,7 +157,31 @@ def login_user():
         return jsonify({"code": 500, "msg": "服务器错误：登录失败"}), 500
 
 
+@app.route("/api/auth/me", methods=["GET"])
+@login_required
+def get_current_user():
+    """返回服务端会话中的当前用户，不读取客户端本地身份标记。"""
+    return jsonify({
+        "code": 200,
+        "msg": "获取当前用户成功",
+        "data": {
+            "id": g.current_user_id,
+            "username": g.current_username,
+        },
+    }), 200
+
+
+@app.route("/api/auth/logout", methods=["POST", "OPTIONS"])
+def logout_user():
+    """清除服务端签名会话。"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    session.clear()
+    return jsonify({"code": 200, "msg": "退出登录成功", "data": {}}), 200
+
+
 @app.route("/extract", methods=["POST", "OPTIONS"])
+@login_required
 def extract_interests():
     """统一处理主题提取与词云请求。"""
     if request.method == "OPTIONS":
@@ -132,6 +196,9 @@ def extract_interests():
 
         if not isinstance(request_data, dict):
             return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+
+        # 用户身份只来自签名会话，丢弃旧客户端可能继续提交的 username 字段。
+        request_data.pop("username", None)
 
         wordcloud_only = request_data.get("wordcloud_only", False)
         if not isinstance(wordcloud_only, bool):
@@ -192,17 +259,17 @@ def extract_interests():
                     "code": 400,
                     "msg": "文本录入文档名重复：" + "、".join(duplicate_in_request),
                 }), 400
-            existing_names = find_existing_document_names(unique_check_names)
+            existing_names = find_existing_document_names(
+                unique_check_names,
+                g.current_user_id,
+            )
             if existing_names:
                 return jsonify({
                     "code": 400,
                     "msg": "文本录入文档名已存在，请更换标题后再抽取：" + "、".join(existing_names),
                 }), 400
 
-        extract_user_id = None
-        extract_username = str(request_data.get("username", "") or "").strip()
-        if extract_username:
-            extract_user_id = find_user_id_by_username(extract_username)
+        extract_user_id = g.current_user_id
 
         if record_recent:
             # 先写入“分析中”批次，后续成功/失败都会更新该记录。
@@ -276,21 +343,26 @@ def extract_interests():
 
 
 @app.route("/task", methods=["GET"])
+@login_required
 def get_recent_docs():
-    """返回最近上传/处理的文档列表。支持 ?username=xxx 过滤当前用户的任务。"""
+    """返回当前登录用户最近上传或处理的文档列表。"""
     try:
-        username = str(request.args.get("username", "") or "").strip() or None
-        return jsonify({"code": 200, "msg": "获取成功", "data": fetch_recent_files(username, MAX_RECENT)}), 200
+        return jsonify({
+            "code": 200,
+            "msg": "获取成功",
+            "data": fetch_recent_files(g.current_user_id, MAX_RECENT),
+        }), 200
     except Exception as exc:
         logger.error(f"获取 recent-docs 错误: {str(exc)}")
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
 
 
 @app.route("/task/<int:task_id>", methods=["GET"])
+@login_required
 def get_task_detail(task_id: int):
-    """返回指定任务所在批次的完整分析结果。"""
+    """返回当前用户指定任务所在批次的完整分析结果。"""
     try:
-        detail = fetch_task_detail(task_id)
+        detail = fetch_task_detail(task_id, g.current_user_id)
         if not detail:
             return jsonify({"code": 404, "msg": "任务不存在"}), 404
         return jsonify(detail), 200
@@ -300,13 +372,11 @@ def get_task_detail(task_id: int):
 
 
 @app.route("/task/<int:task_id>", methods=["DELETE"])
+@login_required
 def delete_task(task_id: int):
-    """删除单条任务及其关联主题数据。"""
+    """删除当前用户的单条任务及其关联主题数据。"""
     try:
-        request_data = request.get_json(silent=True)
-        username = str((request_data or {}).get("username", "") or "").strip() or None
-
-        deleted = delete_task_by_id(task_id, username)
+        deleted = delete_task_by_id(task_id, g.current_user_id)
         if not deleted:
             return jsonify({"code": 404, "msg": "任务不存在或无权限删除"}), 404
         return jsonify({"code": 200, "msg": "删除任务成功", "data": {"task_id": int(task_id)}}), 200
@@ -316,11 +386,12 @@ def delete_task(task_id: int):
 
 
 @app.route("/task", methods=["DELETE"])
+@login_required
 def clear_tasks():
-    """清空全部任务列表数据。"""
+    """只清空当前登录用户的任务列表数据。"""
     try:
-        result = clear_task_history()
-        return jsonify({"code": 200, "msg": "清空任务成功", "data": result}), 200
+        result = clear_task_history(g.current_user_id)
+        return jsonify({"code": 200, "msg": "清空当前用户任务成功", "data": result}), 200
     except Exception as exc:
         logger.error(f"清空任务错误: {str(exc)}")
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
