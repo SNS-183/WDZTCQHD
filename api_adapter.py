@@ -10,6 +10,8 @@ import time
 import pymysql
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from analysis_compare import compare_task_snapshots
+
 from app_logic import (
     build_extract_result,
     build_wordcloud_data,
@@ -21,11 +23,18 @@ from app_logic import (
 )
 from database import (
     clear_task_history,
+    confirm_task_topic,
+    batch_update_tasks,
     create_analysis_task_record,
     create_user,
+    create_task_share,
+    copy_task,
     delete_task_by_id,
     fetch_task_detail,
     fetch_task_summary,
+    fetch_task_comparison_snapshots,
+    fetch_task_audit,
+    fetch_admin_statistics,
     query_task_page,
     rename_task_topic,
     delete_task_topic,
@@ -33,10 +42,17 @@ from database import (
     find_user_by_username,
     find_existing_document_names,
     find_task_by_request_id,
+    get_task_retry_payload,
+    fetch_shared_task,
+    save_task_filter,
+    list_task_filters,
+    delete_task_filter,
     init_database,
     save_extract_result,
     save_wordcloud_result,
     update_analysis_task_status,
+    update_analysis_task_progress,
+    update_task_metadata,
     TASK_STATUS_ERROR,
     TASK_STATUS_DONE,
 )
@@ -116,6 +132,22 @@ def login_required(view_func):
     return wrapped
 
 
+def admin_required(view_func):
+    """要求管理员会话，管理员接口仅提供只读聚合信息。"""
+
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not session.get("user_id"):
+            return jsonify({"code": 401, "msg": "登录状态已失效，请重新登录"}), 401
+        if not session.get("is_admin"):
+            return jsonify({"code": 403, "msg": "仅管理员可访问"}), 403
+        g.current_user_id = int(session["user_id"])
+        g.current_username = str(session.get("username", "") or "")
+        return view_func(*args, **kwargs)
+
+    return wrapped
+
+
 def _parse_auth_payload():
     """解析登录/注册请求体，只接收用户名和密码。"""
     request_data = request.get_json(silent=True)
@@ -181,12 +213,14 @@ def login_user():
         session.clear()
         session["user_id"] = int(user["user_id"])
         session["username"] = str(user["username"])
+        session["is_admin"] = bool(user.get("is_admin", False))
         return jsonify({
             "code": 200,
             "msg": "登录成功",
             "data": {
                 "id": int(user["user_id"]),
                 "username": user["username"],
+                "is_admin": bool(user.get("is_admin", False)),
             },
         }), 200
     except Exception as exc:
@@ -204,8 +238,20 @@ def get_current_user():
         "data": {
             "id": g.current_user_id,
             "username": g.current_username,
+            "is_admin": bool(session.get("is_admin", False)),
         },
     }), 200
+
+
+@app.route("/api/admin/statistics", methods=["GET"])
+@admin_required
+def get_admin_statistics():
+    """返回管理员只读聚合统计。"""
+    try:
+        return jsonify({"code": 200, "msg": "获取系统统计成功", "data": fetch_admin_statistics()}), 200
+    except Exception as exc:
+        logger.error(f"获取管理员统计失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：获取系统统计失败"}), 500
 
 
 @app.route("/api/auth/logout", methods=["POST", "OPTIONS"])
@@ -333,9 +379,12 @@ def extract_interests():
         if record_recent:
             # 先写入“分析中”批次，后续成功/失败都会更新该记录。
             pending_task_id = create_analysis_task_record(request_data, user_id=extract_user_id)
+            update_analysis_task_progress(pending_task_id, extract_user_id, 20)
 
         http_start_ts = time.time()
         extract_result = build_extract_result(texts, file_names, params)
+        if pending_task_id:
+            update_analysis_task_progress(pending_task_id, extract_user_id, 85)
         statistics = dict(extract_result["statistics"])
         statistics["processing_time_ms"] = (time.time() - http_start_ts) * 1000.0
 
@@ -422,10 +471,13 @@ def get_recent_docs():
         keyword = str(request.args.get("keyword", "") or "").strip()[:100]
         status = str(request.args.get("status", "all") or "all").strip().lower()
         sort_order = str(request.args.get("sort", "newest") or "newest").strip().lower()
+        archived = str(request.args.get("archived", "active") or "active").strip().lower()
         if status not in {"all", "done", "running", "error"}:
             return jsonify({"code": 400, "msg": "status 参数无效"}), 400
         if sort_order not in {"newest", "oldest"}:
             return jsonify({"code": 400, "msg": "sort 仅支持 newest 或 oldest"}), 400
+        if archived not in {"active", "archived", "all"}:
+            return jsonify({"code": 400, "msg": "archived 仅支持 active、archived 或 all"}), 400
 
         page_result = query_task_page(
             g.current_user_id,
@@ -436,6 +488,7 @@ def get_recent_docs():
             days=days,
             sort_order=sort_order,
             focus_task_id=focus_task_id,
+            archived=archived,
         )
         return jsonify({
             "code": 200,
@@ -464,6 +517,103 @@ def get_task_detail(task_id: int):
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
 
 
+@app.route("/task/compare", methods=["POST"])
+@login_required
+def compare_tasks():
+    """对比当前用户选择的 2~5 个分析任务。"""
+    request_data = request.get_json(silent=True)
+    raw_task_ids = request_data.get("task_ids") if isinstance(request_data, dict) else None
+    if not isinstance(raw_task_ids, list) or not 2 <= len(raw_task_ids) <= 5:
+        return jsonify({"code": 400, "msg": "请选择 2~5 个任务进行对比"}), 400
+    try:
+        task_ids = list(dict.fromkeys(int(task_id) for task_id in raw_task_ids))
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "任务 ID 必须为整数"}), 400
+    if len(task_ids) < 2 or any(task_id <= 0 for task_id in task_ids):
+        return jsonify({"code": 400, "msg": "请选择至少两个不同的有效任务"}), 400
+    try:
+        snapshots = fetch_task_comparison_snapshots(g.current_user_id, task_ids)
+        if len(snapshots) != len(task_ids):
+            return jsonify({"code": 404, "msg": "部分任务不存在或无权限访问"}), 404
+        return jsonify({"code": 200, "msg": "任务对比成功", "data": compare_task_snapshots(snapshots)}), 200
+    except Exception as exc:
+        logger.error(f"任务对比失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：任务对比失败"}), 500
+
+
+@app.route("/task/filters", methods=["GET", "POST"])
+@login_required
+def task_filters():
+    """列出或保存当前用户的任务筛选条件。"""
+    if request.method == "GET":
+        return jsonify({"code": 200, "msg": "获取筛选条件成功", "data": list_task_filters(g.current_user_id)}), 200
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+    name = str(request_data.get("name", "") or "").strip()
+    filters = request_data.get("filters")
+    if not name or len(name) > 100 or not isinstance(filters, dict):
+        return jsonify({"code": 400, "msg": "筛选名称或筛选内容无效"}), 400
+    allowed_keys = {"keyword", "status", "timeRange", "sort", "archived"}
+    clean_filters = {key: filters[key] for key in allowed_keys if key in filters}
+    return jsonify({
+        "code": 200,
+        "msg": "保存筛选条件成功",
+        "data": save_task_filter(g.current_user_id, name, clean_filters),
+    }), 200
+
+
+@app.route("/task/filters/<int:filter_id>", methods=["DELETE"])
+@login_required
+def remove_task_filter(filter_id: int):
+    """删除当前用户保存的筛选条件。"""
+    if not delete_task_filter(filter_id, g.current_user_id):
+        return jsonify({"code": 404, "msg": "筛选条件不存在"}), 404
+    return jsonify({"code": 200, "msg": "筛选条件删除成功"}), 200
+
+
+@app.route("/task/batch", methods=["POST"])
+@login_required
+def batch_tasks():
+    """批量归档、恢复、打标签或删除当前用户任务。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+    action = str(request_data.get("action", "") or "").strip().lower()
+    raw_task_ids = request_data.get("task_ids")
+    if action not in {"archive", "restore", "tag", "delete"}:
+        return jsonify({"code": 400, "msg": "不支持的批量操作"}), 400
+    if not isinstance(raw_task_ids, list) or not raw_task_ids or len(raw_task_ids) > 100:
+        return jsonify({"code": 400, "msg": "task_ids 需包含 1~100 个任务 ID"}), 400
+    try:
+        task_ids = list(dict.fromkeys(int(task_id) for task_id in raw_task_ids))
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "任务 ID 必须为整数"}), 400
+    if any(task_id <= 0 for task_id in task_ids):
+        return jsonify({"code": 400, "msg": "任务 ID 必须大于 0"}), 400
+
+    tags = None
+    if action == "tag":
+        raw_tags = request_data.get("tags")
+        if not isinstance(raw_tags, list):
+            return jsonify({"code": 400, "msg": "批量打标签时 tags 必须为数组"}), 400
+        tags = list(dict.fromkeys(str(tag or "").strip() for tag in raw_tags if str(tag or "").strip()))
+        if not tags or len(tags) > 10 or any(len(tag) > 20 for tag in tags):
+            return jsonify({"code": 400, "msg": "标签数量或长度不符合要求"}), 400
+
+    try:
+        result = batch_update_tasks(
+            g.current_user_id,
+            task_ids,
+            action,
+            tags=tags,
+        )
+        return jsonify({"code": 200, "msg": "批量操作成功", "data": result}), 200
+    except Exception as exc:
+        logger.error(f"批量操作任务失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：批量操作失败"}), 500
+
+
 @app.route("/task/<int:task_id>", methods=["DELETE"])
 @login_required
 def delete_task(task_id: int):
@@ -476,6 +626,122 @@ def delete_task(task_id: int):
     except Exception as exc:
         logger.error(f"删除任务错误: {str(exc)}")
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+
+
+@app.route("/task/<int:task_id>", methods=["PATCH"])
+@login_required
+def patch_task(task_id: int):
+    """更新任务名称、标签和归档状态。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+
+    name = None
+    if "name" in request_data:
+        name = str(request_data.get("name", "") or "").strip()
+        if not name or len(name) > 100:
+            return jsonify({"code": 400, "msg": "任务名称长度需在 1~100 个字符之间"}), 400
+
+    tags = None
+    if "tags" in request_data:
+        raw_tags = request_data.get("tags")
+        if not isinstance(raw_tags, list):
+            return jsonify({"code": 400, "msg": "tags 必须为数组"}), 400
+        tags = []
+        for item in raw_tags:
+            tag = str(item or "").strip()
+            if tag and tag not in tags:
+                tags.append(tag)
+        if len(tags) > 10 or any(len(tag) > 20 for tag in tags):
+            return jsonify({"code": 400, "msg": "最多设置 10 个标签，每个标签不超过 20 字"}), 400
+
+    archived = request_data.get("archived") if "archived" in request_data else None
+    if archived is not None and not isinstance(archived, bool):
+        return jsonify({"code": 400, "msg": "archived 必须为布尔值"}), 400
+    if name is None and tags is None and archived is None:
+        return jsonify({"code": 400, "msg": "至少提供一个可更新字段"}), 400
+
+    try:
+        result = update_task_metadata(
+            task_id,
+            g.current_user_id,
+            name=name,
+            tags=tags,
+            archived=archived,
+        )
+        if not result:
+            return jsonify({"code": 404, "msg": "任务不存在或无权限修改"}), 404
+        return jsonify({"code": 200, "msg": "任务信息更新成功", "data": result}), 200
+    except Exception as exc:
+        logger.error(f"更新任务信息失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：任务信息更新失败"}), 500
+
+
+@app.route("/task/<int:task_id>/copy", methods=["POST"])
+@login_required
+def copy_owned_task(task_id: int):
+    """复制当前用户已保存的完整分析批次。"""
+    try:
+        result = copy_task(task_id, g.current_user_id)
+        if not result:
+            return jsonify({"code": 404, "msg": "任务不存在或无权限复制"}), 404
+        return jsonify({"code": 200, "msg": "任务复制成功", "data": result}), 201
+    except Exception as exc:
+        logger.error(f"复制任务失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：任务复制失败"}), 500
+
+
+@app.route("/task/<int:task_id>/share", methods=["POST"])
+@login_required
+def share_task(task_id: int):
+    """创建任务只读分享令牌。"""
+    request_data = request.get_json(silent=True) or {}
+    try:
+        expires_days = int(request_data.get("expires_days", 7))
+    except (TypeError, ValueError):
+        return jsonify({"code": 400, "msg": "expires_days 必须为整数"}), 400
+    if not 1 <= expires_days <= 30:
+        return jsonify({"code": 400, "msg": "分享有效期需在 1~30 天之间"}), 400
+    try:
+        result = create_task_share(task_id, g.current_user_id, expires_days)
+        if not result:
+            return jsonify({"code": 404, "msg": "任务不存在或无权限分享"}), 404
+        return jsonify({"code": 200, "msg": "只读分享已创建", "data": result}), 201
+    except Exception as exc:
+        logger.error(f"创建任务分享失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：创建分享失败"}), 500
+
+
+@app.route("/task/<int:task_id>/retry", methods=["POST"])
+@login_required
+def retry_failed_task(task_id: int):
+    """为失败任务准备重新提交所需的原始请求。"""
+    try:
+        retry_payload = get_task_retry_payload(task_id, g.current_user_id)
+        if not retry_payload:
+            return jsonify({"code": 404, "msg": "失败任务不存在、无权限或缺少原始请求"}), 404
+        return jsonify({
+            "code": 200,
+            "msg": "已准备重跑请求",
+            "data": {"source_task_id": int(task_id), "request": retry_payload},
+        }), 200
+    except Exception as exc:
+        logger.error(f"准备失败任务重跑失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：准备重跑失败"}), 500
+
+
+@app.route("/task/<int:task_id>/audit", methods=["GET"])
+@login_required
+def get_task_audit(task_id: int):
+    """返回当前用户任务最近 100 条操作记录。"""
+    try:
+        rows = fetch_task_audit(task_id, g.current_user_id)
+        if rows is None:
+            return jsonify({"code": 404, "msg": "任务不存在或无权限查看"}), 404
+        return jsonify({"code": 200, "msg": "获取审计记录成功", "data": rows}), 200
+    except Exception as exc:
+        logger.error(f"获取任务审计失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：获取审计记录失败"}), 500
 
 
 @app.route("/task/<int:task_id>/topics/<topic_identifier>", methods=["PATCH"])
@@ -496,6 +762,31 @@ def rename_topic(task_id: int, topic_identifier: str):
     except Exception as exc:
         logger.error(f"重命名主题失败: {str(exc)}")
         return jsonify({"code": 500, "msg": "服务器错误：主题重命名失败"}), 500
+
+
+@app.route(
+    "/task/<int:task_id>/topics/<topic_identifier>/confirmation",
+    methods=["PATCH"],
+)
+@login_required
+def confirm_topic(task_id: int, topic_identifier: str):
+    """更新主题的人工确认状态。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict) or not isinstance(request_data.get("confirmed"), bool):
+        return jsonify({"code": 400, "msg": "confirmed 必须为布尔值"}), 400
+    try:
+        result = confirm_task_topic(
+            task_id,
+            topic_identifier,
+            g.current_user_id,
+            request_data["confirmed"],
+        )
+        if not result:
+            return jsonify({"code": 404, "msg": "主题不存在或无权限修改"}), 404
+        return jsonify({"code": 200, "msg": "主题确认状态更新成功", "data": result}), 200
+    except Exception as exc:
+        logger.error(f"更新主题确认状态失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：确认状态更新失败"}), 500
 
 
 @app.route("/task/<int:task_id>/topics/<topic_identifier>", methods=["DELETE"])
@@ -552,6 +843,20 @@ def clear_tasks():
     except Exception as exc:
         logger.error(f"清空任务错误: {str(exc)}")
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+
+
+@app.route("/share/<share_token>", methods=["GET"])
+def get_shared_task(share_token: str):
+    """无需登录读取有效令牌对应的脱敏只读任务。"""
+    try:
+        detail = fetch_shared_task(share_token)
+        if not detail:
+            return jsonify({"code": 404, "msg": "分享不存在或已过期"}), 404
+        detail["msg"] = "获取只读分享成功"
+        return jsonify(detail), 200
+    except Exception as exc:
+        logger.error(f"读取任务分享失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：读取分享失败"}), 500
 
 
 if __name__ == "__main__":

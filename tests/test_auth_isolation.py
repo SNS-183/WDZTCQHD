@@ -31,6 +31,19 @@ def _install_dependency_fakes():
         "rename_task_topic",
         "delete_task_topic",
         "merge_task_topics",
+        "update_task_metadata",
+        "batch_update_tasks",
+        "copy_task",
+        "get_task_retry_payload",
+        "fetch_task_audit",
+        "fetch_admin_statistics",
+        "confirm_task_topic",
+        "fetch_task_comparison_snapshots",
+        "create_task_share",
+        "fetch_shared_task",
+        "save_task_filter",
+        "list_task_filters",
+        "delete_task_filter",
         "find_user_by_username",
         "find_user_id_by_username",
         "find_existing_document_names",
@@ -39,6 +52,7 @@ def _install_dependency_fakes():
         "save_extract_result",
         "save_wordcloud_result",
         "update_analysis_task_status",
+        "update_analysis_task_progress",
     ):
         setattr(database, name, Mock())
 
@@ -109,6 +123,7 @@ class AuthIsolationTest(unittest.TestCase):
             days=0,
             sort_order="newest",
             focus_task_id=None,
+            archived="active",
         )
 
     def test_task_list_supports_server_side_filters_and_pagination(self):
@@ -145,6 +160,7 @@ class AuthIsolationTest(unittest.TestCase):
             days=30,
             sort_order="oldest",
             focus_task_id=42,
+            archived="active",
         )
 
     def test_clear_tasks_only_clears_current_user(self):
@@ -206,6 +222,163 @@ class AuthIsolationTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.database.delete_task_by_id.assert_called_once_with(42, 7)
 
+    def test_user_can_update_owned_task_metadata(self):
+        """任务名称、标签和归档状态只能由任务所有者修改。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.update_task_metadata.return_value = {
+            "task_id": 42,
+            "name": "季度能源报告",
+            "tags": ["能源", "季度"],
+            "archived": True,
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.patch(
+            "/task/42",
+            json={"name": "季度能源报告", "tags": ["能源", "季度"], "archived": True},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["data"]["archived"])
+        self.database.update_task_metadata.assert_called_once_with(
+            42,
+            7,
+            name="季度能源报告",
+            tags=["能源", "季度"],
+            archived=True,
+        )
+
+    def test_user_can_batch_archive_owned_tasks(self):
+        """批量操作仍由后端按当前用户收口，客户端不能越权指定用户。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.batch_update_tasks.return_value = {
+            "action": "archive",
+            "affected_count": 2,
+            "task_ids": [11, 12],
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post(
+            "/task/batch",
+            json={"action": "archive", "task_ids": [11, 12]},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, response.get_json()["data"]["affected_count"])
+        self.database.batch_update_tasks.assert_called_once_with(
+            7,
+            [11, 12],
+            "archive",
+            tags=None,
+        )
+
+    def test_user_can_copy_owned_task(self):
+        """复制任务生成新的批次 ID，并保留来源任务关系。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.copy_task.return_value = {
+            "task_id": 99,
+            "parent_task_id": 42,
+            "name": "能源报告 - 副本",
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post("/task/42/copy")
+
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(99, response.get_json()["data"]["task_id"])
+        self.database.copy_task.assert_called_once_with(42, 7)
+
+    def test_failed_task_can_prepare_retry_payload(self):
+        """失败任务重跑只返回当前用户原始请求，并强制生成新的幂等键。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.get_task_retry_payload.return_value = {
+            "texts": ["能源分析正文"],
+            "file_names": ["能源.txt"],
+            "record_recent": True,
+            "_retry_source_task_id": 42,
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post("/task/42/retry")
+
+        self.assertEqual(200, response.status_code)
+        self.assertNotIn("request_id", response.get_json()["data"]["request"])
+        self.database.get_task_retry_payload.assert_called_once_with(42, 7)
+
+    def test_admin_can_read_aggregate_statistics(self):
+        """管理员统计只通过只读接口返回聚合值。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 1,
+            "username": "admin",
+            "password_hash": generate_password_hash("secret12"),
+            "is_admin": 1,
+        }
+        self.database.fetch_admin_statistics.return_value = {
+            "user_count": 3,
+            "task_count": 12,
+            "document_count": 20,
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "secret12"},
+        )
+
+        response = self.client.get("/api/admin/statistics")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(12, response.get_json()["data"]["task_count"])
+        self.database.fetch_admin_statistics.assert_called_once_with()
+
+    def test_user_can_create_read_only_share_for_owned_task(self):
+        """创建分享令牌时后端始终绑定当前用户和指定任务。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.create_task_share.return_value = {
+            "token": "safe-share-token",
+            "expires_at": "2026-07-23 10:00:00",
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post("/task/42/share", json={"expires_days": 7})
+
+        self.assertEqual(201, response.status_code)
+        self.assertEqual("safe-share-token", response.get_json()["data"]["token"])
+        self.database.create_task_share.assert_called_once_with(42, 7, 7)
+
     def test_user_can_rename_topic_in_owned_task(self):
         self.database.find_user_by_username.return_value = {
             "user_id": 7,
@@ -226,6 +399,28 @@ class AuthIsolationTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("新能源主题", response.get_json()["data"]["theme"])
         self.database.rename_task_topic.assert_called_once_with(11, "topic-1", 7, "新能源主题")
+
+    def test_user_can_confirm_topic_in_owned_task(self):
+        """人工确认状态持久化到主题记录，详情页可稳定恢复。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.confirm_task_topic.return_value = {"id": "topic-1", "confirmed": True}
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.patch(
+            "/task/11/topics/topic-1/confirmation",
+            json={"confirmed": True},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["data"]["confirmed"])
+        self.database.confirm_task_topic.assert_called_once_with(11, "topic-1", 7, True)
 
     def test_user_can_delete_topic_from_owned_task(self):
         self.database.find_user_by_username.return_value = {

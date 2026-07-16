@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import requests
 import zipfile
 from collections import Counter
 from io import BytesIO
@@ -14,6 +15,8 @@ import jieba.posseg as pseg
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+from extract_config import parse_extract_params
 
 
 logger = logging.getLogger(__name__)
@@ -128,7 +131,7 @@ def _extract_legacy_doc_text(raw_bytes: bytes) -> str:
 
 
 def _extract_pdf_text(raw_bytes: bytes) -> str:
-    """从 PDF 页面中提取文本，扫描件 PDF 需要 OCR 后再上传。"""
+    """从 PDF 文本层提取正文，空文本层按配置自动回退 OCR。"""
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -152,7 +155,27 @@ def _extract_pdf_text(raw_bytes: bytes) -> str:
             page_text = ""
         if page_text.strip():
             page_texts.append(page_text.strip())
-    return "\n\n".join(page_texts)
+    extracted_text = "\n\n".join(page_texts)
+    if extracted_text.strip():
+        return extracted_text
+
+    ocr_service_url = str(os.getenv("OCR_SERVICE_URL", "") or "").strip()
+    if not ocr_service_url:
+        raise ValueError("扫描件 PDF 未检测到文本层，请配置 OCR_SERVICE_URL 后重试")
+    try:
+        response = requests.post(
+            ocr_service_url,
+            json={"content_base64": base64.b64encode(raw_bytes).decode("ascii")},
+            timeout=int(os.getenv("OCR_TIMEOUT_SECONDS", "60")),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        ocr_text = str(payload.get("text", "") or "").strip()
+    except Exception as exc:
+        raise ValueError("扫描件 PDF 的 OCR 服务调用失败，请检查 OCR 配置") from exc
+    if not ocr_text:
+        raise ValueError("OCR 未识别到有效正文，请检查扫描清晰度")
+    return ocr_text
 
 
 def extract_text_from_document_payload(file_payload: dict) -> tuple[str, str]:
@@ -323,47 +346,6 @@ def parse_wordcloud_params(request_data: dict):
     }, None
 
 
-def parse_extract_params(request_data: dict):
-    """解析 /extract 的主题提取参数。"""
-    defaults = {
-        "topic_k": 5,
-        "topn_keywords": 10,
-        "granularity": "sentence",
-        "with_evidence": True,
-        "evidence_topn": 30,
-        "return_topics": True,
-        "return_matrix": True,
-        "normalize_score": True,
-        "debug": False,
-    }
-    params = dict(defaults)
-    for key in defaults:
-        if key in request_data:
-            params[key] = request_data.get(key)
-
-    try:
-        params["topic_k"] = int(params["topic_k"])
-        params["topn_keywords"] = int(params["topn_keywords"])
-        params["evidence_topn"] = int(params["evidence_topn"])
-    except Exception:
-        return None, "参数错误：topic_k/topn_keywords/evidence_topn 必须为整数"
-
-    bool_fields = ["with_evidence", "return_topics", "return_matrix", "normalize_score", "debug"]
-    for field in bool_fields:
-        if not isinstance(params[field], bool):
-            return None, f"参数错误：{field} 必须为布尔值"
-
-    if params["granularity"] not in {"sentence", "doc"}:
-        return None, "参数错误：granularity 仅支持 sentence 或 doc"
-    if not (1 <= params["topic_k"] <= 30):
-        return None, "参数错误：topic_k 需在 1~30 之间"
-    if not (3 <= params["topn_keywords"] <= 50):
-        return None, "参数错误：topn_keywords 需在 3~50 之间"
-    if not (1 <= params["evidence_topn"] <= 200):
-        return None, "参数错误：evidence_topn 需在 1~200 之间"
-    return params, None
-
-
 def parse_request_file_names(request_data: dict, text_count: int):
     """解析可选的 file_names 参数。"""
     raw_file_names = request_data.get("file_names")
@@ -384,9 +366,18 @@ def _is_chinese_token(token: str) -> bool:
     return bool(token) and all("\u4e00" <= ch <= "\u9fff" for ch in token)
 
 
-def _tokenize(text: str, min_len: int = 2, max_len: int = 5):
+def _tokenize(
+    text: str,
+    min_len: int = 2,
+    max_len: int = 5,
+    custom_stopwords=None,
+    domain_terms=None,
+):
+    custom_stopword_set = set(custom_stopwords or [])
+    configured_domain_terms = [term for term in (domain_terms or []) if term]
     try:
-        tokens = []
+        # 领域词优先进入候选集，避免通用分词器把专业术语拆散。
+        tokens = [term for term in configured_domain_terms if term in text and term not in custom_stopword_set]
         for word, flag in pseg.lcut(text):
             word = word.strip()
             if not word:
@@ -395,7 +386,7 @@ def _tokenize(text: str, min_len: int = 2, max_len: int = 5):
                 continue
             if not (min_len <= len(word) <= max_len):
                 continue
-            if word in CN_STOP:
+            if word in CN_STOP or word in custom_stopword_set:
                 continue
             if flag not in ALLOWED_POS:
                 continue
@@ -405,7 +396,7 @@ def _tokenize(text: str, min_len: int = 2, max_len: int = 5):
         extra = re.findall(pattern, text)
         seen = set(tokens)
         for item in extra:
-            if item in seen or item in CN_STOP:
+            if item in seen or item in CN_STOP or item in custom_stopword_set:
                 continue
             if not (min_len <= len(item) <= max_len):
                 continue
@@ -423,7 +414,13 @@ def _tokenize(text: str, min_len: int = 2, max_len: int = 5):
         logger.exception("分词失败，回退到正则抽词")
 
     pattern = r"[\u4e00-\u9fff]{" + str(min_len) + r"," + str(max_len) + r"}"
-    return [word for word in re.findall(pattern, text) if word not in CN_STOP]
+    fallback_terms = [term for term in configured_domain_terms if term in text and term not in custom_stopword_set]
+    fallback_terms.extend(
+        word
+        for word in re.findall(pattern, text)
+        if word not in CN_STOP and word not in custom_stopword_set
+    )
+    return _unique_keep_order(fallback_terms)
 
 
 def _build_tfidf(sentences, min_len: int, max_len: int = 5):
@@ -850,10 +847,18 @@ def _generate_core_theme(keywords, text):
     return stripped[:8] if stripped else ""
 
 
-def _build_extract_vectorizer(sentences):
+def _build_extract_vectorizer(sentences, params):
+    custom_stopwords = params.get("custom_stopwords", [])
+    domain_terms = params.get("domain_terms", [])
     vectorizer_candidates = [
         TfidfVectorizer(
-            tokenizer=lambda item: _tokenize(item, min_len=2, max_len=5),
+            tokenizer=lambda item: _tokenize(
+                item,
+                min_len=2,
+                max_len=5,
+                custom_stopwords=custom_stopwords,
+                domain_terms=domain_terms,
+            ),
             lowercase=False,
         ),
         TfidfVectorizer(
@@ -908,7 +913,7 @@ def _build_extract_topics(doc_items, params):
     if not all_sentences:
         all_sentences = [item["text"] for item in doc_items]
 
-    vectorizer, sentence_tfidf = _build_extract_vectorizer(all_sentences)
+    vectorizer, sentence_tfidf = _build_extract_vectorizer(all_sentences, params)
     if vectorizer is None or sentence_tfidf is None:
         return topics, topic_keyword_weights, doc_topic_scores, 0, len(all_sentences)
 
@@ -1150,6 +1155,12 @@ def build_extract_result(texts, file_names, params):
             "language": guess_language(text),
             "upload_time": upload_time_str,
         }
+        if str(file_info["name"]).lower().endswith(".pdf"):
+            low_density = len(text.strip()) < 300
+            file_info["parse_quality"] = {
+                "level": "low" if low_density else "good",
+                "message": "PDF 文本密度偏低，建议检查 OCR 结果" if low_density else "PDF 文本解析正常",
+            }
         all_files.append(file_info)
         doc_items.append(
             {
@@ -1294,6 +1305,19 @@ def build_extract_result(texts, file_names, params):
 
     total_theme_count = int(len(visual_topics))
     total_doc_theme_count = int(len(doc_themes))
+    average_confidence = (
+        sum(float(item.get("confidence", 0) or 0) for item in doc_themes) / len(doc_themes)
+        if doc_themes
+        else 0.0
+    )
+    covered_document_ids = {str(item.get("file_id", "")) for item in doc_themes if item.get("file_id")}
+    coverage_ratio = len(covered_document_ids) / len(doc_items) if doc_items else 0.0
+    topic_diversity = len({item.get("theme") for item in doc_themes if item.get("theme")}) / max(
+        len(doc_themes), 1
+    )
+    quality_score = 100 * (
+        0.45 * coverage_ratio + 0.35 * average_confidence + 0.20 * topic_diversity
+    )
 
     return {
         "files": all_files,
@@ -1308,7 +1332,20 @@ def build_extract_result(texts, file_names, params):
             "theme_count": total_theme_count,
             "doc_theme_count": total_doc_theme_count,
             "global_topic_count": int(len(global_topics)),
-            "algorithm_version": "http-v1.1.0",
+            "algorithm_version": "http-v1.2.0",
+            "quality_metrics": {
+                "quality_score": round(quality_score, 2),
+                "coverage_ratio": round(coverage_ratio, 4),
+                "average_confidence": round(average_confidence, 4),
+                "topic_diversity": round(topic_diversity, 4),
+            },
+            "extract_config": {
+                "topic_k": params["topic_k"],
+                "topn_keywords": params["topn_keywords"],
+                "granularity": params["granularity"],
+                "custom_stopwords": params.get("custom_stopwords", []),
+                "domain_terms": params.get("domain_terms", []),
+            },
         },
         "debug": {
             "modeled_topic_k": int(max(modeled_topic_k, global_modeled_topic_k)),

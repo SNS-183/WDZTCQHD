@@ -1,8 +1,9 @@
 import json
 import logging
 import os
+import secrets
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pymysql
 
@@ -73,6 +74,7 @@ def init_database():
                     user_id BIGINT PRIMARY KEY AUTO_INCREMENT,
                     username VARCHAR(64) NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
+                    is_admin TINYINT(1) NOT NULL DEFAULT 0,
                     create_time DATETIME NOT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uk_users_username (username)
@@ -93,6 +95,10 @@ def init_database():
                     request_id VARCHAR(64) NULL,
                     request_payload_json JSON NULL,
                     response_payload_json JSON NULL,
+                    tags_json JSON NULL,
+                    is_archived TINYINT(1) NOT NULL DEFAULT 0,
+                    progress INT NOT NULL DEFAULT 0,
+                    parent_task_id BIGINT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_analysis_tasks_create_time (create_time),
                     INDEX idx_analysis_tasks_user_id (user_id),
@@ -142,6 +148,7 @@ def init_database():
                     confidence FLOAT NULL,
                     score DOUBLE NOT NULL DEFAULT 0,
                     theme_evidence VARCHAR(1024) NOT NULL DEFAULT '',
+                    is_confirmed TINYINT(1) NOT NULL DEFAULT 0,
                     create_time DATETIME NOT NULL,
                     topic_payload_json JSON NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -213,7 +220,68 @@ def init_database():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            # 任务操作审计表只保存结构化元数据，不记录文档正文和请求内容。
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_audit_logs (
+                    audit_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    task_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    action VARCHAR(64) NOT NULL,
+                    detail_json JSON NULL,
+                    create_time DATETIME NOT NULL,
+                    INDEX idx_task_audit_task_id (task_id),
+                    INDEX idx_task_audit_user_id (user_id),
+                    CONSTRAINT fk_task_audit_task
+                        FOREIGN KEY (task_id) REFERENCES analysis_tasks(task_id)
+                        ON DELETE CASCADE,
+                    CONSTRAINT fk_task_audit_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS saved_task_filters (
+                    filter_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    user_id BIGINT NOT NULL,
+                    filter_name VARCHAR(100) NOT NULL,
+                    filters_json JSON NOT NULL,
+                    create_time DATETIME NOT NULL,
+                    UNIQUE KEY uk_saved_filter_user_name (user_id, filter_name),
+                    CONSTRAINT fk_saved_filter_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_shares (
+                    share_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    task_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    share_token VARCHAR(96) NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    create_time DATETIME NOT NULL,
+                    UNIQUE KEY uk_task_share_token (share_token),
+                    INDEX idx_task_share_task_id (task_id),
+                    CONSTRAINT fk_task_share_task
+                        FOREIGN KEY (task_id) REFERENCES analysis_tasks(task_id)
+                        ON DELETE CASCADE,
+                    CONSTRAINT fk_task_share_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
             # 兼容旧库：历史库如果缺少任务状态列，启动时自动补齐。
+            cursor.execute("SHOW COLUMNS FROM users LIKE 'is_admin'")
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "ALTER TABLE users ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0 AFTER password_hash"
+                )
             cursor.execute("SHOW COLUMNS FROM analysis_tasks LIKE 'task_status'")
             if cursor.fetchone() is None:
                 cursor.execute(
@@ -232,6 +300,24 @@ def init_database():
                 cursor.execute(
                     "ALTER TABLE analysis_tasks ADD UNIQUE KEY "
                     "uk_analysis_tasks_user_request (user_id, request_id)"
+                )
+            # 兼容旧库：逐列补齐任务管理 2.0 所需元数据。
+            for column_name, column_sql in (
+                ("tags_json", "JSON NULL AFTER response_payload_json"),
+                ("is_archived", "TINYINT(1) NOT NULL DEFAULT 0 AFTER tags_json"),
+                ("progress", "INT NOT NULL DEFAULT 0 AFTER is_archived"),
+                ("parent_task_id", "BIGINT NULL AFTER progress"),
+            ):
+                cursor.execute(f"SHOW COLUMNS FROM analysis_tasks LIKE '{column_name}'")
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        f"ALTER TABLE analysis_tasks ADD COLUMN {column_name} {column_sql}"
+                    )
+            cursor.execute("SHOW COLUMNS FROM topic_info LIKE 'is_confirmed'")
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "ALTER TABLE topic_info ADD COLUMN is_confirmed "
+                    "TINYINT(1) NOT NULL DEFAULT 0 AFTER theme_evidence"
                 )
         connection.commit()
     _db_initialized = True
@@ -288,8 +374,9 @@ def create_analysis_task_record(
                 """
                 INSERT INTO analysis_tasks (
                     task_name, file_count, theme_count, task_status,
-                    create_time, user_id, request_id, request_payload_json, response_payload_json
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    create_time, user_id, request_id, request_payload_json, response_payload_json,
+                    progress, parent_task_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     task_name,
@@ -301,6 +388,8 @@ def create_analysis_task_record(
                     request_id,
                     json.dumps(request_payload or {}, ensure_ascii=False),
                     None,
+                    5,
+                    int((request_payload or {}).get("_retry_source_task_id", 0) or 0) or None,
                 ),
             )
             task_id = int(cursor.lastrowid)
@@ -322,14 +411,34 @@ def update_analysis_task_status(
                 """
                 UPDATE analysis_tasks
                 SET task_status = %s,
-                    response_payload_json = COALESCE(%s, response_payload_json)
+                    response_payload_json = COALESCE(%s, response_payload_json),
+                    progress = %s
                 WHERE task_id = %s
                 """,
                 (
                     status,
                     json.dumps(response_payload, ensure_ascii=False) if response_payload is not None else None,
+                    100 if status in {TASK_STATUS_DONE, TASK_STATUS_ERROR} else 5,
                     int(task_id),
                 ),
+            )
+        connection.commit()
+
+
+def update_analysis_task_progress(task_id: int, user_id: int, progress: int) -> None:
+    """更新运行中任务进度，限制在任务所有者范围内。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    normalized_progress = min(99, max(0, int(progress)))
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE analysis_tasks
+                SET progress = %s
+                WHERE task_id = %s AND user_id = %s AND task_status = %s
+                """,
+                (normalized_progress, int(task_id), int(user_id), TASK_STATUS_RUNNING),
             )
         connection.commit()
 
@@ -357,7 +466,8 @@ def _insert_normalized_extract_result(
                 task_status = %s,
                 user_id = %s,
                 request_payload_json = %s,
-                response_payload_json = %s
+                response_payload_json = %s,
+                progress = 100
             WHERE task_id = %s
             """,
             (
@@ -377,8 +487,9 @@ def _insert_normalized_extract_result(
             """
             INSERT INTO analysis_tasks (
                 task_name, file_count, theme_count, task_status,
-                create_time, user_id, request_id, request_payload_json, response_payload_json
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                create_time, user_id, request_id, request_payload_json, response_payload_json,
+                progress
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 100)
             """,
             (
                 task_name,
@@ -572,6 +683,7 @@ def query_task_page(
     days: int = 0,
     sort_order: str = "newest",
     focus_task_id: int | None = None,
+    archived: str = "active",
 ) -> dict:
     """在用户隔离范围内完成任务筛选、排序、分页和定位页计算。"""
     ensure_database_ready()
@@ -596,6 +708,10 @@ def query_task_page(
     if int(days or 0) > 0:
         where_parts.append("at.create_time >= DATE_SUB(NOW(), INTERVAL %s DAY)")
         params.append(int(days))
+    if archived == "archived":
+        where_parts.append("at.is_archived = 1")
+    elif archived != "all":
+        where_parts.append("at.is_archived = 0")
 
     where_sql = " AND ".join(where_parts)
     direction = "ASC" if sort_order == "oldest" else "DESC"
@@ -654,17 +770,27 @@ def query_task_page(
                     ) AS upload_time,
                     at.file_count AS doc_count,
                     at.task_status AS status,
-                    at.task_status AS task_status
+                    at.task_status AS task_status,
+                    at.tags_json,
+                    at.is_archived,
+                    at.progress,
+                    at.parent_task_id
                 FROM analysis_tasks at
                 LEFT JOIN document_info di ON di.task_id = at.task_id
                 WHERE {where_sql}
-                GROUP BY at.task_id, at.task_name, at.file_count, at.task_status, at.create_time
+                GROUP BY at.task_id, at.task_name, at.file_count, at.task_status, at.create_time,
+                    at.tags_json, at.is_archived, at.progress, at.parent_task_id
                 ORDER BY at.create_time {direction}, at.task_id {direction}
                 LIMIT %s OFFSET %s
                 """,
                 (*params, normalized_page_size, offset),
             )
             items = list(cursor.fetchall())
+
+    for item in items:
+        item["tags"] = _parse_json_field(item.pop("tags_json", None), [])
+        item["archived"] = bool(item.pop("is_archived", 0))
+        item["progress"] = min(100, max(0, int(item.get("progress", 0) or 0)))
 
     return {
         "items": items,
@@ -691,6 +817,7 @@ def fetch_task_summary(user_id: int) -> dict:
                     SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS done_count,
                     SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS running_count,
                     SUM(CASE WHEN task_status = %s THEN 1 ELSE 0 END) AS error_count,
+                    SUM(CASE WHEN is_archived = 1 THEN 1 ELSE 0 END) AS archived_count,
                     COALESCE(SUM(file_count), 0) AS document_count
                 FROM analysis_tasks
                 WHERE user_id = %s
@@ -703,8 +830,553 @@ def fetch_task_summary(user_id: int) -> dict:
                 "done_count": int(row.get("done_count", 0) or 0),
                 "running_count": int(row.get("running_count", 0) or 0),
                 "error_count": int(row.get("error_count", 0) or 0),
+                "archived_count": int(row.get("archived_count", 0) or 0),
                 "document_count": int(row.get("document_count", 0) or 0),
             }
+
+
+def _append_task_audit(cursor, task_id: int, user_id: int, action: str, detail: dict | None = None):
+    """在同一事务中追加任务操作记录。"""
+    cursor.execute(
+        """
+        INSERT INTO task_audit_logs (task_id, user_id, action, detail_json, create_time)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (
+            int(task_id),
+            int(user_id),
+            str(action),
+            json.dumps(detail or {}, ensure_ascii=False),
+            datetime.now(),
+        ),
+    )
+
+
+def update_task_metadata(
+    task_id: int,
+    user_id: int,
+    *,
+    name: str | None = None,
+    tags: list[str] | None = None,
+    archived: bool | None = None,
+) -> dict | None:
+    """集中更新任务名称、标签和归档状态，并记录审计日志。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    updates = []
+    params = []
+    detail = {}
+    if name is not None:
+        updates.append("task_name = %s")
+        params.append(str(name))
+        detail["name"] = str(name)
+    if tags is not None:
+        updates.append("tags_json = %s")
+        params.append(json.dumps(tags, ensure_ascii=False))
+        detail["tags"] = tags
+    if archived is not None:
+        updates.append("is_archived = %s")
+        params.append(1 if archived else 0)
+        detail["archived"] = bool(archived)
+    if not updates:
+        return None
+
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE analysis_tasks SET {', '.join(updates)} "
+                "WHERE task_id = %s AND user_id = %s",
+                (*params, int(task_id), int(user_id)),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            _append_task_audit(cursor, task_id, user_id, "update_metadata", detail)
+            cursor.execute(
+                """
+                SELECT task_id, task_name, tags_json, is_archived, progress, parent_task_id
+                FROM analysis_tasks
+                WHERE task_id = %s AND user_id = %s
+                LIMIT 1
+                """,
+                (int(task_id), int(user_id)),
+            )
+            row = cursor.fetchone() or {}
+        connection.commit()
+
+    return {
+        "task_id": int(row.get("task_id", task_id)),
+        "name": str(row.get("task_name", name or "")),
+        "tags": _parse_json_field(row.get("tags_json"), []),
+        "archived": bool(row.get("is_archived", 0)),
+        "progress": int(row.get("progress", 0) or 0),
+        "parent_task_id": row.get("parent_task_id"),
+    }
+
+
+def batch_update_tasks(
+    user_id: int,
+    task_ids: list[int],
+    action: str,
+    *,
+    tags: list[str] | None = None,
+) -> dict:
+    """在当前用户范围内执行归档、恢复、打标签或删除操作。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    normalized_ids = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+    if not normalized_ids:
+        return {"action": action, "affected_count": 0, "task_ids": []}
+
+    placeholders = ", ".join(["%s"] * len(normalized_ids))
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT task_id, tags_json FROM analysis_tasks "
+                f"WHERE user_id = %s AND task_id IN ({placeholders})",
+                (int(user_id), *normalized_ids),
+            )
+            owned_rows = list(cursor.fetchall())
+            owned_ids = [int(row["task_id"]) for row in owned_rows]
+            if not owned_ids:
+                return {"action": action, "affected_count": 0, "task_ids": []}
+
+            owned_placeholders = ", ".join(["%s"] * len(owned_ids))
+            if action in {"archive", "restore"}:
+                archived_value = 1 if action == "archive" else 0
+                cursor.execute(
+                    f"UPDATE analysis_tasks SET is_archived = %s "
+                    f"WHERE user_id = %s AND task_id IN ({owned_placeholders})",
+                    (archived_value, int(user_id), *owned_ids),
+                )
+                for task_id in owned_ids:
+                    _append_task_audit(
+                        cursor,
+                        task_id,
+                        user_id,
+                        action,
+                        {"archived": bool(archived_value)},
+                    )
+            elif action == "tag":
+                clean_tags = list(dict.fromkeys(tags or []))
+                row_map = {int(row["task_id"]): row for row in owned_rows}
+                for task_id in owned_ids:
+                    current_tags = _parse_json_field(row_map[task_id].get("tags_json"), [])
+                    merged_tags = list(dict.fromkeys([*current_tags, *clean_tags]))[:10]
+                    cursor.execute(
+                        "UPDATE analysis_tasks SET tags_json = %s "
+                        "WHERE task_id = %s AND user_id = %s",
+                        (json.dumps(merged_tags, ensure_ascii=False), task_id, int(user_id)),
+                    )
+                    _append_task_audit(cursor, task_id, user_id, action, {"tags": merged_tags})
+            elif action == "delete":
+                cursor.execute(
+                    f"DELETE FROM analysis_tasks WHERE user_id = %s "
+                    f"AND task_id IN ({owned_placeholders})",
+                    (int(user_id), *owned_ids),
+                )
+                _delete_orphan_keywords(cursor)
+            else:
+                raise ValueError("不支持的批量操作")
+        connection.commit()
+
+    return {
+        "action": action,
+        "affected_count": len(owned_ids),
+        "task_ids": owned_ids,
+    }
+
+
+def copy_task(task_id: int, user_id: int) -> dict | None:
+    """复制完整分析批次，规范化文档、主题和关键词关系随批次一起复制。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    now = datetime.now()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM analysis_tasks WHERE task_id = %s AND user_id = %s LIMIT 1",
+                (int(task_id), int(user_id)),
+            )
+            source = cursor.fetchone()
+            if not source:
+                return None
+
+            copy_name = f"{str(source.get('task_name') or '分析任务')} - 副本"
+            cursor.execute(
+                """
+                INSERT INTO analysis_tasks (
+                    task_name, file_count, theme_count, task_status, create_time,
+                    user_id, request_id, request_payload_json, response_payload_json,
+                    tags_json, is_archived, progress, parent_task_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, 0, %s, %s)
+                """,
+                (
+                    copy_name,
+                    int(source.get("file_count", 0) or 0),
+                    int(source.get("theme_count", 0) or 0),
+                    str(source.get("task_status") or TASK_STATUS_DONE),
+                    now,
+                    int(user_id),
+                    source.get("request_payload_json"),
+                    source.get("response_payload_json"),
+                    source.get("tags_json"),
+                    int(source.get("progress", 100) or 0),
+                    int(task_id),
+                ),
+            )
+            new_task_id = int(cursor.lastrowid)
+
+            cursor.execute(
+                "SELECT * FROM document_info WHERE task_id = %s ORDER BY document_id",
+                (int(task_id),),
+            )
+            source_documents = list(cursor.fetchall())
+            document_id_map = {}
+            for document in source_documents:
+                cursor.execute(
+                    """
+                    INSERT INTO document_info (
+                        task_id, document_source_id, document_name, document_index,
+                        document_content, word_count, sentence_count, language,
+                        upload_time, sentences_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        new_task_id,
+                        document.get("document_source_id"),
+                        document.get("document_name"),
+                        document.get("document_index"),
+                        document.get("document_content"),
+                        document.get("word_count"),
+                        document.get("sentence_count"),
+                        document.get("language"),
+                        document.get("upload_time"),
+                        document.get("sentences_json"),
+                    ),
+                )
+                document_id_map[int(document["document_id"])] = int(cursor.lastrowid)
+
+            cursor.execute(
+                "SELECT * FROM topic_info WHERE task_id = %s ORDER BY topic_id",
+                (int(task_id),),
+            )
+            source_topics = list(cursor.fetchall())
+            for topic in source_topics:
+                source_topic_id = int(topic["topic_id"])
+                cursor.execute(
+                    """
+                    INSERT INTO topic_info (
+                        task_id, document_id, topic_record_id, topic_name, topic_index,
+                        summary, confidence, score, theme_evidence, is_confirmed,
+                        create_time, topic_payload_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        new_task_id,
+                        document_id_map[int(topic["document_id"])],
+                        topic.get("topic_record_id"),
+                        topic.get("topic_name"),
+                        topic.get("topic_index"),
+                        topic.get("summary"),
+                        topic.get("confidence"),
+                        topic.get("score"),
+                        topic.get("theme_evidence"),
+                        int(topic.get("is_confirmed", 0) or 0),
+                        now,
+                        topic.get("topic_payload_json"),
+                    ),
+                )
+                new_topic_id = int(cursor.lastrowid)
+                cursor.execute(
+                    """
+                    INSERT INTO topic_keyword_relations (
+                        topic_id, keyword_id, keyword_weight, keyword_count, source_json
+                    )
+                    SELECT %s, keyword_id, keyword_weight, keyword_count, source_json
+                    FROM topic_keyword_relations
+                    WHERE topic_id = %s
+                    """,
+                    (new_topic_id, source_topic_id),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO task_statistics (
+                    task_id, file_count, theme_count, doc_theme_count,
+                    processing_time_ms, algorithm_version, create_time
+                )
+                SELECT %s, file_count, theme_count, doc_theme_count,
+                    processing_time_ms, algorithm_version, %s
+                FROM task_statistics
+                WHERE task_id = %s
+                """,
+                (new_task_id, now, int(task_id)),
+            )
+            _append_task_audit(cursor, task_id, user_id, "copy_source", {"copy_task_id": new_task_id})
+            _append_task_audit(cursor, new_task_id, user_id, "copied_from", {"source_task_id": int(task_id)})
+        connection.commit()
+
+    return {
+        "task_id": new_task_id,
+        "parent_task_id": int(task_id),
+        "name": copy_name,
+    }
+
+
+def get_task_retry_payload(task_id: int, user_id: int) -> dict | None:
+    """读取当前用户失败任务的原始请求，清理旧幂等键后用于重新提交。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT request_payload_json
+                FROM analysis_tasks
+                WHERE task_id = %s AND user_id = %s AND task_status = %s
+                LIMIT 1
+                """,
+                (int(task_id), int(user_id), TASK_STATUS_ERROR),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            payload = _parse_json_field(row.get("request_payload_json"), {})
+            if not isinstance(payload, dict) or not payload:
+                return None
+            payload = dict(payload)
+            payload.pop("request_id", None)
+            payload.pop("username", None)
+            payload["record_recent"] = True
+            payload["_retry_source_task_id"] = int(task_id)
+            _append_task_audit(cursor, task_id, user_id, "retry_requested")
+        connection.commit()
+    return payload
+
+
+def fetch_task_audit(task_id: int, user_id: int) -> list[dict] | None:
+    """读取当前用户任务的操作审计记录。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT task_id FROM analysis_tasks WHERE task_id = %s AND user_id = %s LIMIT 1",
+                (int(task_id), int(user_id)),
+            )
+            if not cursor.fetchone():
+                return None
+            cursor.execute(
+                """
+                SELECT audit_id, action, detail_json,
+                    DATE_FORMAT(create_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS create_time
+                FROM task_audit_logs
+                WHERE task_id = %s AND user_id = %s
+                ORDER BY audit_id DESC
+                LIMIT 100
+                """,
+                (int(task_id), int(user_id)),
+            )
+            rows = list(cursor.fetchall())
+    for row in rows:
+        row["detail"] = _parse_json_field(row.pop("detail_json", None), {})
+    return rows
+
+
+def fetch_admin_statistics() -> dict:
+    """返回不含正文和身份敏感字段的系统聚合统计。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM users) AS user_count,
+                    (SELECT COUNT(*) FROM analysis_tasks) AS task_count,
+                    (SELECT COUNT(*) FROM document_info) AS document_count,
+                    (SELECT COUNT(*) FROM analysis_tasks WHERE task_status = %s) AS done_count,
+                    (SELECT COUNT(*) FROM analysis_tasks WHERE task_status = %s) AS running_count,
+                    (SELECT COUNT(*) FROM analysis_tasks WHERE task_status = %s) AS error_count,
+                    (SELECT COUNT(*) FROM analysis_tasks WHERE is_archived = 1) AS archived_count
+                """,
+                (TASK_STATUS_DONE, TASK_STATUS_RUNNING, TASK_STATUS_ERROR),
+            )
+            row = cursor.fetchone() or {}
+    return {key: int(value or 0) for key, value in row.items()}
+
+
+def fetch_task_comparison_snapshots(user_id: int, task_ids: list[int]) -> list[dict]:
+    """按传入顺序读取当前用户任务的主题与质量快照。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    normalized_ids = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+    snapshots = []
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            for task_id in normalized_ids:
+                cursor.execute(
+                    """
+                    SELECT at.task_id, at.task_name, at.response_payload_json,
+                        ts.algorithm_version
+                    FROM analysis_tasks at
+                    LEFT JOIN task_statistics ts ON ts.task_id = at.task_id
+                    WHERE at.task_id = %s AND at.user_id = %s
+                    LIMIT 1
+                    """,
+                    (task_id, int(user_id)),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    continue
+                response_payload = _parse_json_field(row.get("response_payload_json"), {})
+                response_data = response_payload.get("data", {}) if isinstance(response_payload, dict) else {}
+                statistics = response_data.get("statistics", {}) if isinstance(response_data, dict) else {}
+                snapshots.append({
+                    "task_id": int(row["task_id"]),
+                    "name": str(row.get("task_name") or ""),
+                    "algorithm_version": str(
+                        row.get("algorithm_version")
+                        or statistics.get("algorithm_version")
+                        or ""
+                    ),
+                    "quality_metrics": statistics.get("quality_metrics", {}),
+                    "themes": _fetch_normalized_task_topics(cursor, task_id),
+                })
+    return snapshots
+
+
+def save_task_filter(user_id: int, name: str, filters: dict) -> dict:
+    """保存或覆盖当前用户的任务筛选条件。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    now = datetime.now()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO saved_task_filters (user_id, filter_name, filters_json, create_time)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE filters_json = VALUES(filters_json), create_time = VALUES(create_time)
+                """,
+                (int(user_id), str(name), json.dumps(filters, ensure_ascii=False), now),
+            )
+            cursor.execute(
+                """
+                SELECT filter_id FROM saved_task_filters
+                WHERE user_id = %s AND filter_name = %s
+                LIMIT 1
+                """,
+                (int(user_id), str(name)),
+            )
+            row = cursor.fetchone() or {}
+        connection.commit()
+    return {"filter_id": int(row.get("filter_id", 0)), "name": str(name), "filters": filters}
+
+
+def list_task_filters(user_id: int) -> list[dict]:
+    """列出当前用户保存的筛选条件。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT filter_id, filter_name, filters_json,
+                    DATE_FORMAT(create_time, '%%Y-%%m-%%d %%H:%%i:%%s') AS create_time
+                FROM saved_task_filters
+                WHERE user_id = %s
+                ORDER BY create_time DESC, filter_id DESC
+                """,
+                (int(user_id),),
+            )
+            rows = list(cursor.fetchall())
+    return [{
+        "filter_id": int(row["filter_id"]),
+        "name": str(row.get("filter_name") or ""),
+        "filters": _parse_json_field(row.get("filters_json"), {}),
+        "create_time": str(row.get("create_time") or ""),
+    } for row in rows]
+
+
+def delete_task_filter(filter_id: int, user_id: int) -> bool:
+    """删除当前用户的一条保存筛选。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM saved_task_filters WHERE filter_id = %s AND user_id = %s",
+                (int(filter_id), int(user_id)),
+            )
+            deleted = cursor.rowcount > 0
+        connection.commit()
+    return deleted
+
+
+def create_task_share(task_id: int, user_id: int, expires_days: int) -> dict | None:
+    """为当前用户任务创建高熵只读分享令牌。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    now = datetime.now()
+    expires_at = now + timedelta(days=int(expires_days))
+    share_token = secrets.token_urlsafe(32)
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT task_id FROM analysis_tasks WHERE task_id = %s AND user_id = %s LIMIT 1",
+                (int(task_id), int(user_id)),
+            )
+            if not cursor.fetchone():
+                return None
+            cursor.execute(
+                """
+                INSERT INTO task_shares (task_id, user_id, share_token, expires_at, create_time)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (int(task_id), int(user_id), share_token, expires_at, now),
+            )
+            _append_task_audit(
+                cursor,
+                task_id,
+                user_id,
+                "create_share",
+                {"expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S")},
+            )
+        connection.commit()
+    return {"token": share_token, "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def fetch_shared_task(share_token: str) -> dict | None:
+    """通过未过期令牌读取脱敏后的只读任务详情。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT task_id, user_id, expires_at
+                FROM task_shares
+                WHERE share_token = %s AND expires_at > NOW()
+                LIMIT 1
+                """,
+                (str(share_token),),
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None
+    detail = fetch_task_detail(int(row["task_id"]), int(row["user_id"]))
+    if not detail:
+        return None
+    data = detail.get("data", {})
+    for file_info in data.get("files", []) if isinstance(data, dict) else []:
+        file_info.pop("content", None)
+        file_info.pop("raw_text", None)
+        file_info.pop("sentences", None)
+        file_info.pop("task_id", None)
+    data["read_only"] = True
+    data["share_expires_at"] = row["expires_at"].strftime("%Y-%m-%d %H:%M:%S")
+    return detail
 
 
 def _parse_json_field(value, default):
@@ -770,6 +1442,7 @@ def _fetch_normalized_task_topics(cursor, task_id: int) -> list[dict]:
             ti.confidence,
             ti.score,
             ti.theme_evidence,
+            ti.is_confirmed,
             ti.topic_payload_json,
             di.document_source_id AS file_id,
             di.document_index AS file_index,
@@ -803,6 +1476,7 @@ def _fetch_normalized_task_topics(cursor, task_id: int) -> list[dict]:
                 "confidence": float(row.get("confidence", 0) or 0),
                 "score": float(row.get("score", 0) or 0),
                 "theme_evidence": str(row.get("theme_evidence") or ""),
+                "confirmed": bool(row.get("is_confirmed", 0)),
                 "file_id": str(row.get("file_id") or ""),
                 "file_index": int(row.get("file_index", 0) or 0),
                 "file_name": str(row.get("file_name") or ""),
@@ -1005,6 +1679,58 @@ def rename_task_topic(task_id: int, topic_identifier: str, user_id: int, new_nam
     }
 
 
+def confirm_task_topic(
+    task_id: int,
+    topic_identifier: str,
+    user_id: int,
+    confirmed: bool,
+) -> dict | None:
+    """持久化主题人工确认状态并记录审计。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ti.topic_id, ti.topic_record_id
+                FROM topic_info ti
+                INNER JOIN analysis_tasks at ON at.task_id = ti.task_id
+                WHERE ti.task_id = %s AND at.user_id = %s
+                  AND (ti.topic_record_id = %s OR CAST(ti.topic_id AS CHAR) = %s)
+                LIMIT 1
+                """,
+                (int(task_id), int(user_id), str(topic_identifier), str(topic_identifier)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                """
+                UPDATE topic_info
+                SET is_confirmed = %s,
+                    topic_payload_json = JSON_SET(
+                        COALESCE(topic_payload_json, JSON_OBJECT()),
+                        '$.confirmed', %s
+                    )
+                WHERE topic_id = %s
+                """,
+                (1 if confirmed else 0, bool(confirmed), int(row["topic_id"])),
+            )
+            _append_task_audit(
+                cursor,
+                task_id,
+                user_id,
+                "confirm_topic" if confirmed else "unconfirm_topic",
+                {"topic_id": str(topic_identifier)},
+            )
+        connection.commit()
+    return {
+        "id": str(row.get("topic_record_id") or row["topic_id"]),
+        "topic_id": int(row["topic_id"]),
+        "confirmed": bool(confirmed),
+    }
+
+
 def _refresh_task_theme_counts(cursor, task_id: int):
     """主题编辑后重新计算批次主题数量。"""
     cursor.execute("SELECT COUNT(*) AS count FROM topic_info WHERE task_id = %s", (int(task_id),))
@@ -1154,17 +1880,24 @@ def create_user(username: str, password_hash: str) -> dict:
     ensure_database_ready()
     settings = get_db_settings()
     create_time = datetime.now()
+    admin_names = {
+        item.strip()
+        for item in os.getenv("ADMIN_USERNAMES", "admin").split(",")
+        if item.strip()
+    }
+    is_admin = username in admin_names
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO users (username, password_hash, create_time) VALUES (%s, %s, %s)",
-                (username, password_hash, create_time),
+                "INSERT INTO users (username, password_hash, is_admin, create_time) VALUES (%s, %s, %s, %s)",
+                (username, password_hash, 1 if is_admin else 0, create_time),
             )
             user_id = int(cursor.lastrowid)
         connection.commit()
         return {
             "user_id": user_id,
             "username": username,
+            "is_admin": is_admin,
             "create_time": create_time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -1176,7 +1909,7 @@ def find_user_by_username(username: str) -> dict | None:
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT user_id, username, password_hash, create_time FROM users WHERE username = %s LIMIT 1",
+                "SELECT user_id, username, password_hash, is_admin, create_time FROM users WHERE username = %s LIMIT 1",
                 (username,),
             )
             return cursor.fetchone()
