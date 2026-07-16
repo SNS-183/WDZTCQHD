@@ -38,6 +38,14 @@ waitress-serve --host=127.0.0.1 --port=5000 api_adapter:app
 - 生产环境必须固定设置 `APP_SECRET_KEY`，并在 HTTPS 下设置 `SESSION_COOKIE_SECURE=true`。
 - `CORS_ORIGINS` 应只填写实际部署的前端地址，多个地址使用英文逗号分隔。
 
+## 任务检索与主题编辑
+
+- `GET /task` 支持 `page`、`page_size`、`keyword`、`status`、`days`、`sort` 和
+  `focus_task_id`；其中 `days` 支持 `0/7/30/90`，`sort` 支持 `newest/oldest`。
+- `PATCH /task/<task_id>/topics/<topic_id>` 重命名当前用户任务内的主题。
+- `DELETE /task/<task_id>/topics/<topic_id>` 删除主题并刷新批次统计。
+- `POST /task/<task_id>/topics/merge` 合并同一文档内的多个主题。
+
 ## 回归测试
 
 ```powershell

@@ -562,14 +562,80 @@ def find_existing_document_names(file_names: list[str], user_id: int) -> list[st
     return [name for name in clean_names if name in existed_names]
 
 
-def fetch_recent_files(user_id: int, limit: int = 20) -> list[dict]:
-    """读取当前用户任务列表，包含已完成文档以及失败/分析中的批次记录。"""
+def query_task_page(
+    user_id: int,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    keyword: str = "",
+    status: str = "all",
+    days: int = 0,
+    sort_order: str = "newest",
+    focus_task_id: int | None = None,
+) -> dict:
+    """在用户隔离范围内完成任务筛选、排序、分页和定位页计算。"""
     ensure_database_ready()
     settings = get_db_settings()
+    status_map = {
+        "done": TASK_STATUS_DONE,
+        "running": TASK_STATUS_RUNNING,
+        "error": TASK_STATUS_ERROR,
+    }
+    where_parts = ["at.user_id = %s"]
+    params: list = [int(user_id)]
+    clean_keyword = str(keyword or "").strip()
+    if clean_keyword:
+        like_keyword = f"%{clean_keyword}%"
+        where_parts.append(
+            "(at.task_name LIKE %s OR CAST(at.task_id AS CHAR) LIKE %s OR at.task_status LIKE %s)"
+        )
+        params.extend([like_keyword, like_keyword, like_keyword])
+    if status in status_map:
+        where_parts.append("at.task_status = %s")
+        params.append(status_map[status])
+    if int(days or 0) > 0:
+        where_parts.append("at.create_time >= DATE_SUB(NOW(), INTERVAL %s DAY)")
+        params.append(int(days))
+
+    where_sql = " AND ".join(where_parts)
+    direction = "ASC" if sort_order == "oldest" else "DESC"
+    normalized_page = max(int(page), 1)
+    normalized_page_size = min(max(int(page_size), 1), 100)
 
     with get_connection(settings["database"]) as connection:
         with connection.cursor() as cursor:
-            base_sql = """
+            cursor.execute(
+                f"SELECT COUNT(*) AS total FROM analysis_tasks at WHERE {where_sql}",
+                tuple(params),
+            )
+            total = int((cursor.fetchone() or {}).get("total", 0) or 0)
+            total_pages = max((total + normalized_page_size - 1) // normalized_page_size, 1)
+            normalized_page = min(normalized_page, total_pages)
+
+            focus_page = None
+            if focus_task_id:
+                cursor.execute(
+                    f"SELECT at.create_time, at.task_id FROM analysis_tasks at "
+                    f"WHERE {where_sql} AND at.task_id = %s LIMIT 1",
+                    (*params, int(focus_task_id)),
+                )
+                focus_row = cursor.fetchone()
+                if focus_row:
+                    comparator = ">" if direction == "DESC" else "<"
+                    id_comparator = ">" if direction == "DESC" else "<"
+                    cursor.execute(
+                        f"SELECT COUNT(*) AS before_count FROM analysis_tasks at "
+                        f"WHERE {where_sql} AND "
+                        f"(at.create_time {comparator} %s OR "
+                        f"(at.create_time = %s AND at.task_id {id_comparator} %s))",
+                        (*params, focus_row["create_time"], focus_row["create_time"], int(focus_task_id)),
+                    )
+                    before_count = int((cursor.fetchone() or {}).get("before_count", 0) or 0)
+                    focus_page = before_count // normalized_page_size + 1
+
+            offset = (normalized_page - 1) * normalized_page_size
+            cursor.execute(
+                f"""
                 SELECT
                     at.task_id,
                     at.task_id AS batch_id,
@@ -586,24 +652,30 @@ def fetch_recent_files(user_id: int, limit: int = 20) -> list[dict]:
                         COALESCE(MAX(di.upload_time), at.create_time),
                         '%%Y-%%m-%%d %%H:%%i:%%s'
                     ) AS upload_time,
-                    at.task_name,
                     at.file_count AS doc_count,
                     at.task_status AS status,
                     at.task_status AS task_status
                 FROM analysis_tasks at
                 LEFT JOIN document_info di ON di.task_id = at.task_id
-            """
-            cursor.execute(
-                base_sql
-                + """
-                WHERE at.user_id = %s
+                WHERE {where_sql}
                 GROUP BY at.task_id, at.task_name, at.file_count, at.task_status, at.create_time
-                ORDER BY COALESCE(MAX(di.upload_time), at.create_time) DESC, at.task_id DESC
-                LIMIT %s
+                ORDER BY at.create_time {direction}, at.task_id {direction}
+                LIMIT %s OFFSET %s
                 """,
-                (int(user_id), int(limit)),
+                (*params, normalized_page_size, offset),
             )
-            return list(cursor.fetchall())
+            items = list(cursor.fetchall())
+
+    return {
+        "items": items,
+        "pagination": {
+            "page": normalized_page,
+            "page_size": normalized_page_size,
+            "total": total,
+            "total_pages": total_pages,
+        },
+        "focus_page": focus_page,
+    }
 
 
 def fetch_task_summary(user_id: int) -> dict:
@@ -683,6 +755,72 @@ def _delete_orphan_keywords(cursor):
         WHERE tkr.keyword_id IS NULL
         """
     )
+
+
+def _fetch_normalized_task_topics(cursor, task_id: int) -> list[dict]:
+    """从规范化主题表重建详情，确保编辑结果覆盖初始响应快照。"""
+    cursor.execute(
+        """
+        SELECT
+            ti.topic_id,
+            ti.topic_record_id,
+            ti.topic_name,
+            ti.topic_index,
+            ti.summary,
+            ti.confidence,
+            ti.score,
+            ti.theme_evidence,
+            ti.topic_payload_json,
+            di.document_source_id AS file_id,
+            di.document_index AS file_index,
+            di.document_name AS file_name,
+            ki.keyword_text,
+            tkr.keyword_weight,
+            tkr.keyword_count,
+            tkr.source_json
+        FROM topic_info ti
+        INNER JOIN document_info di ON di.document_id = ti.document_id
+        LEFT JOIN topic_keyword_relations tkr ON tkr.topic_id = ti.topic_id
+        LEFT JOIN keyword_info ki ON ki.keyword_id = tkr.keyword_id
+        WHERE ti.task_id = %s
+        ORDER BY di.document_index ASC, ti.topic_index ASC, tkr.keyword_weight DESC, ki.keyword_id ASC
+        """,
+        (int(task_id),),
+    )
+    topic_map = {}
+    for row in cursor.fetchall():
+        topic_id = int(row["topic_id"])
+        if topic_id not in topic_map:
+            payload = _parse_json_field(row.get("topic_payload_json"), {})
+            item = dict(payload) if isinstance(payload, dict) else {}
+            item.update({
+                "id": str(row.get("topic_record_id") or topic_id),
+                "topic_id": topic_id,
+                "topic_record_id": str(row.get("topic_record_id") or topic_id),
+                "theme": str(row.get("topic_name") or "未命名主题"),
+                "topic_index": int(row.get("topic_index", 0) or 0),
+                "summary": str(row.get("summary") or ""),
+                "confidence": float(row.get("confidence", 0) or 0),
+                "score": float(row.get("score", 0) or 0),
+                "theme_evidence": str(row.get("theme_evidence") or ""),
+                "file_id": str(row.get("file_id") or ""),
+                "file_index": int(row.get("file_index", 0) or 0),
+                "file_name": str(row.get("file_name") or ""),
+                "keywords": [],
+                "keyword_details": [],
+            })
+            topic_map[topic_id] = item
+        keyword_text = str(row.get("keyword_text") or "").strip()
+        if keyword_text:
+            detail = {
+                "text": keyword_text,
+                "weight": float(row.get("keyword_weight", 0) or 0),
+                "count": int(row.get("keyword_count", 0) or 0),
+                "source": _parse_json_field(row.get("source_json"), {}),
+            }
+            topic_map[topic_id]["keywords"].append(keyword_text)
+            topic_map[topic_id]["keyword_details"].append(detail)
+    return list(topic_map.values())
 
 
 def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
@@ -765,6 +903,10 @@ def fetch_task_detail(task_id: int, user_id: int) -> dict | None:
                     }
                 )
 
+            normalized_topics = _fetch_normalized_task_topics(cursor, normalized_task_id)
+            data["themes"] = normalized_topics
+            data["doc_themes"] = normalized_topics
+
             data["files"] = files
             data["file_count"] = len(files)
             data["selected_task_id"] = normalized_task_id
@@ -820,6 +962,170 @@ def delete_task_by_id(task_id: int, user_id: int) -> bool:
 
         connection.commit()
         return True
+
+
+def rename_task_topic(task_id: int, topic_identifier: str, user_id: int, new_name: str):
+    """重命名当前用户任务内的主题，并同步主题 JSON 快照。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ti.topic_id, ti.topic_record_id
+                FROM topic_info ti
+                INNER JOIN analysis_tasks at ON at.task_id = ti.task_id
+                WHERE ti.task_id = %s
+                  AND at.user_id = %s
+                  AND (ti.topic_record_id = %s OR CAST(ti.topic_id AS CHAR) = %s)
+                LIMIT 1
+                """,
+                (int(task_id), int(user_id), str(topic_identifier), str(topic_identifier)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                """
+                UPDATE topic_info
+                SET topic_name = %s,
+                    topic_payload_json = JSON_SET(
+                        COALESCE(topic_payload_json, JSON_OBJECT()),
+                        '$.theme', %s
+                    )
+                WHERE topic_id = %s
+                """,
+                (str(new_name), str(new_name), int(row["topic_id"])),
+            )
+        connection.commit()
+    return {
+        "id": str(row.get("topic_record_id") or row["topic_id"]),
+        "topic_id": int(row["topic_id"]),
+        "theme": str(new_name),
+    }
+
+
+def _refresh_task_theme_counts(cursor, task_id: int):
+    """主题编辑后重新计算批次主题数量。"""
+    cursor.execute("SELECT COUNT(*) AS count FROM topic_info WHERE task_id = %s", (int(task_id),))
+    theme_count = int((cursor.fetchone() or {}).get("count", 0) or 0)
+    cursor.execute(
+        "UPDATE analysis_tasks SET theme_count = %s WHERE task_id = %s",
+        (theme_count, int(task_id)),
+    )
+    cursor.execute(
+        "UPDATE task_statistics SET theme_count = %s, doc_theme_count = %s WHERE task_id = %s",
+        (theme_count, theme_count, int(task_id)),
+    )
+
+
+def delete_task_topic(task_id: int, topic_identifier: str, user_id: int) -> bool:
+    """删除当前用户任务中的单个主题并刷新统计。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ti.topic_id
+                FROM topic_info ti
+                INNER JOIN analysis_tasks at ON at.task_id = ti.task_id
+                WHERE ti.task_id = %s
+                  AND at.user_id = %s
+                  AND (ti.topic_record_id = %s OR CAST(ti.topic_id AS CHAR) = %s)
+                LIMIT 1
+                """,
+                (int(task_id), int(user_id), str(topic_identifier), str(topic_identifier)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            cursor.execute("DELETE FROM topic_info WHERE topic_id = %s", (int(row["topic_id"]),))
+            _refresh_task_theme_counts(cursor, task_id)
+            _delete_orphan_keywords(cursor)
+        connection.commit()
+    return True
+
+
+def merge_task_topics(
+    task_id: int,
+    topic_identifiers: list[str],
+    user_id: int,
+    merged_name: str,
+):
+    """合并同一文档中的多个主题，保留首个主题并汇总关键词关系。"""
+    ensure_database_ready()
+    settings = get_db_settings()
+    requested_ids = [str(item) for item in topic_identifiers]
+    with get_connection(settings["database"]) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ti.topic_id, ti.topic_record_id, ti.document_id
+                FROM topic_info ti
+                INNER JOIN analysis_tasks at ON at.task_id = ti.task_id
+                WHERE ti.task_id = %s AND at.user_id = %s
+                ORDER BY ti.topic_id ASC
+                """,
+                (int(task_id), int(user_id)),
+            )
+            rows = [
+                row for row in cursor.fetchall()
+                if str(row.get("topic_record_id")) in requested_ids
+                or str(row.get("topic_id")) in requested_ids
+            ]
+            if len(rows) != len(set(requested_ids)):
+                return None
+            if len({int(row["document_id"]) for row in rows}) != 1:
+                raise ValueError("只能合并同一文档内的主题")
+
+            target = rows[0]
+            target_topic_id = int(target["topic_id"])
+            source_topic_ids = [int(row["topic_id"]) for row in rows]
+            placeholders = ", ".join(["%s"] * len(source_topic_ids))
+            cursor.execute(
+                f"""
+                INSERT INTO topic_keyword_relations (
+                    topic_id, keyword_id, keyword_weight, keyword_count, source_json
+                )
+                SELECT %s, keyword_id, MAX(keyword_weight), SUM(keyword_count), MAX(CAST(source_json AS CHAR))
+                FROM topic_keyword_relations
+                WHERE topic_id IN ({placeholders})
+                GROUP BY keyword_id
+                ON DUPLICATE KEY UPDATE
+                    keyword_weight = GREATEST(keyword_weight, VALUES(keyword_weight)),
+                    keyword_count = VALUES(keyword_count),
+                    source_json = VALUES(source_json)
+                """,
+                (target_topic_id, *source_topic_ids),
+            )
+            removable_ids = [topic_id for topic_id in source_topic_ids if topic_id != target_topic_id]
+            if removable_ids:
+                removable_placeholders = ", ".join(["%s"] * len(removable_ids))
+                cursor.execute(
+                    f"DELETE FROM topic_info WHERE topic_id IN ({removable_placeholders})",
+                    tuple(removable_ids),
+                )
+            cursor.execute(
+                """
+                UPDATE topic_info
+                SET topic_name = %s,
+                    topic_payload_json = JSON_SET(
+                        COALESCE(topic_payload_json, JSON_OBJECT()),
+                        '$.theme', %s
+                    )
+                WHERE topic_id = %s
+                """,
+                (str(merged_name), str(merged_name), target_topic_id),
+            )
+            _refresh_task_theme_counts(cursor, task_id)
+            _delete_orphan_keywords(cursor)
+        connection.commit()
+    return {
+        "id": str(target.get("topic_record_id") or target_topic_id),
+        "topic_id": target_topic_id,
+        "theme": str(merged_name),
+    }
 
 
 def clear_task_history(user_id: int) -> dict:

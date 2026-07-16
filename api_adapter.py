@@ -25,8 +25,11 @@ from database import (
     create_user,
     delete_task_by_id,
     fetch_task_detail,
-    fetch_recent_files,
     fetch_task_summary,
+    query_task_page,
+    rename_task_topic,
+    delete_task_topic,
+    merge_task_topics,
     find_user_by_username,
     find_existing_document_names,
     find_task_by_request_id,
@@ -83,9 +86,6 @@ logging.basicConfig(
     handlers=[log_handler],
 )
 logger = logging.getLogger(__name__)
-
-MAX_RECENT = 20
-
 
 @app.errorhandler(413)
 def handle_request_too_large(_error):
@@ -325,7 +325,7 @@ def extract_interests():
             if existing_names:
                 return jsonify({
                     "code": 400,
-                    "msg": "文本录入文档名已存在，请更换标题后再抽取：" + "、".join(existing_names),
+                    "msg": "当前账号下已存在同名手工文档，请更换标题后再抽取：" + "、".join(existing_names),
                 }), 400
 
         extract_user_id = g.current_user_id
@@ -405,12 +405,44 @@ def extract_interests():
 @app.route("/task", methods=["GET"])
 @login_required
 def get_recent_docs():
-    """返回当前登录用户最近上传或处理的文档列表。"""
+    """分页返回当前用户任务，支持关键词、状态、时间范围和排序。"""
     try:
+        try:
+            page = int(request.args.get("page", 1))
+            page_size = int(request.args.get("page_size", 20))
+            days = int(request.args.get("days", 0))
+            focus_task_id = int(request.args.get("focus_task_id", 0)) or None
+        except (TypeError, ValueError):
+            return jsonify({"code": 400, "msg": "分页、时间范围和定位任务参数必须为整数"}), 400
+        if page < 1 or not 1 <= page_size <= 100:
+            return jsonify({"code": 400, "msg": "page 必须大于 0，page_size 需在 1~100 之间"}), 400
+        if days not in {0, 7, 30, 90}:
+            return jsonify({"code": 400, "msg": "days 仅支持 0、7、30、90"}), 400
+
+        keyword = str(request.args.get("keyword", "") or "").strip()[:100]
+        status = str(request.args.get("status", "all") or "all").strip().lower()
+        sort_order = str(request.args.get("sort", "newest") or "newest").strip().lower()
+        if status not in {"all", "done", "running", "error"}:
+            return jsonify({"code": 400, "msg": "status 参数无效"}), 400
+        if sort_order not in {"newest", "oldest"}:
+            return jsonify({"code": 400, "msg": "sort 仅支持 newest 或 oldest"}), 400
+
+        page_result = query_task_page(
+            g.current_user_id,
+            page=page,
+            page_size=page_size,
+            keyword=keyword,
+            status=status,
+            days=days,
+            sort_order=sort_order,
+            focus_task_id=focus_task_id,
+        )
         return jsonify({
             "code": 200,
             "msg": "获取成功",
-            "data": fetch_recent_files(g.current_user_id, MAX_RECENT),
+            "data": page_result["items"],
+            "pagination": page_result["pagination"],
+            "focus_page": page_result.get("focus_page"),
             "summary": fetch_task_summary(g.current_user_id),
         }), 200
     except Exception as exc:
@@ -444,6 +476,70 @@ def delete_task(task_id: int):
     except Exception as exc:
         logger.error(f"删除任务错误: {str(exc)}")
         return jsonify({"code": 500, "msg": f"服务器错误：{str(exc)}"}), 500
+
+
+@app.route("/task/<int:task_id>/topics/<topic_identifier>", methods=["PATCH"])
+@login_required
+def rename_topic(task_id: int, topic_identifier: str):
+    """重命名当前用户任务中的主题。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+    new_name = str(request_data.get("name", "") or "").strip()
+    if not new_name or len(new_name) > 100:
+        return jsonify({"code": 400, "msg": "主题名称长度需在 1~100 个字符之间"}), 400
+    try:
+        result = rename_task_topic(task_id, topic_identifier, g.current_user_id, new_name)
+        if not result:
+            return jsonify({"code": 404, "msg": "主题不存在或无权限修改"}), 404
+        return jsonify({"code": 200, "msg": "主题重命名成功", "data": result}), 200
+    except Exception as exc:
+        logger.error(f"重命名主题失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：主题重命名失败"}), 500
+
+
+@app.route("/task/<int:task_id>/topics/<topic_identifier>", methods=["DELETE"])
+@login_required
+def delete_topic(task_id: int, topic_identifier: str):
+    """删除当前用户任务中的主题。"""
+    try:
+        deleted = delete_task_topic(task_id, topic_identifier, g.current_user_id)
+        if not deleted:
+            return jsonify({"code": 404, "msg": "主题不存在或无权限删除"}), 404
+        return jsonify({"code": 200, "msg": "主题删除成功", "data": {"id": topic_identifier}}), 200
+    except Exception as exc:
+        logger.error(f"删除主题失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：主题删除失败"}), 500
+
+
+@app.route("/task/<int:task_id>/topics/merge", methods=["POST"])
+@login_required
+def merge_topics(task_id: int):
+    """合并当前用户任务中同一文档内的多个主题。"""
+    request_data = request.get_json(silent=True)
+    if not isinstance(request_data, dict):
+        return jsonify({"code": 400, "msg": "请求体必须为 JSON 对象"}), 400
+    topic_ids = request_data.get("topic_ids")
+    merged_name = str(request_data.get("name", "") or "").strip()
+    if not isinstance(topic_ids, list) or len(set(map(str, topic_ids))) < 2:
+        return jsonify({"code": 400, "msg": "至少选择两个不同主题进行合并"}), 400
+    if not merged_name or len(merged_name) > 100:
+        return jsonify({"code": 400, "msg": "合并主题名称长度需在 1~100 个字符之间"}), 400
+    try:
+        result = merge_task_topics(
+            task_id,
+            [str(item) for item in topic_ids],
+            g.current_user_id,
+            merged_name,
+        )
+        if not result:
+            return jsonify({"code": 404, "msg": "主题不存在或无权限合并"}), 404
+        return jsonify({"code": 200, "msg": "主题合并成功", "data": result}), 200
+    except ValueError as exc:
+        return jsonify({"code": 400, "msg": str(exc)}), 400
+    except Exception as exc:
+        logger.error(f"合并主题失败: {str(exc)}")
+        return jsonify({"code": 500, "msg": "服务器错误：主题合并失败"}), 500
 
 
 @app.route("/task", methods=["DELETE"])

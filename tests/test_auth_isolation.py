@@ -26,8 +26,11 @@ def _install_dependency_fakes():
         "create_user",
         "delete_task_by_id",
         "fetch_task_detail",
-        "fetch_recent_files",
         "fetch_task_summary",
+        "query_task_page",
+        "rename_task_topic",
+        "delete_task_topic",
+        "merge_task_topics",
         "find_user_by_username",
         "find_user_id_by_username",
         "find_existing_document_names",
@@ -45,6 +48,11 @@ def _install_dependency_fakes():
         "running_count": 0,
         "error_count": 0,
         "document_count": 0,
+    }
+    database.query_task_page.return_value = {
+        "items": [],
+        "pagination": {"page": 1, "page_size": 20, "total": 0, "total_pages": 1},
+        "focus_page": None,
     }
 
     sys.modules["app_logic"] = app_logic
@@ -75,7 +83,7 @@ class AuthIsolationTest(unittest.TestCase):
 
         self.assertEqual(401, response.status_code)
         self.assertEqual(401, response.get_json()["code"])
-        self.database.fetch_recent_files.assert_not_called()
+        self.database.query_task_page.assert_not_called()
 
     def test_logged_in_user_only_lists_own_tasks(self):
         self.database.find_user_by_username.return_value = {
@@ -83,7 +91,6 @@ class AuthIsolationTest(unittest.TestCase):
             "username": "alice",
             "password_hash": generate_password_hash("secret12"),
         }
-        self.database.fetch_recent_files.return_value = []
 
         login_response = self.client.post(
             "/api/auth/login",
@@ -93,7 +100,52 @@ class AuthIsolationTest(unittest.TestCase):
 
         self.assertEqual(200, login_response.status_code)
         self.assertEqual(200, list_response.status_code)
-        self.database.fetch_recent_files.assert_called_once_with(7, 20)
+        self.database.query_task_page.assert_called_once_with(
+            7,
+            page=1,
+            page_size=20,
+            keyword="",
+            status="all",
+            days=0,
+            sort_order="newest",
+            focus_task_id=None,
+        )
+
+    def test_task_list_supports_server_side_filters_and_pagination(self):
+        """任务页参数由接口校验后原样交给当前用户范围的查询模块。"""
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.query_task_page.return_value = {
+            "items": [{"task_id": 42, "name": "能源报告"}],
+            "pagination": {"page": 2, "page_size": 10, "total": 11, "total_pages": 2},
+            "focus_page": 2,
+        }
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.get(
+            "/task?page=2&page_size=10&keyword=%E8%83%BD%E6%BA%90&status=done"
+            "&days=30&sort=oldest&focus_task_id=42"
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(42, response.get_json()["data"][0]["task_id"])
+        self.assertEqual(11, response.get_json()["pagination"]["total"])
+        self.database.query_task_page.assert_called_once_with(
+            7,
+            page=2,
+            page_size=10,
+            keyword="能源",
+            status="done",
+            days=30,
+            sort_order="oldest",
+            focus_task_id=42,
+        )
 
     def test_clear_tasks_only_clears_current_user(self):
         self.database.find_user_by_username.return_value = {
@@ -153,6 +205,67 @@ class AuthIsolationTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.database.delete_task_by_id.assert_called_once_with(42, 7)
+
+    def test_user_can_rename_topic_in_owned_task(self):
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.rename_task_topic.return_value = {"id": "topic-1", "theme": "新能源主题"}
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.patch(
+            "/task/11/topics/topic-1",
+            json={"name": "新能源主题"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("新能源主题", response.get_json()["data"]["theme"])
+        self.database.rename_task_topic.assert_called_once_with(11, "topic-1", 7, "新能源主题")
+
+    def test_user_can_delete_topic_from_owned_task(self):
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.delete_task_topic.return_value = True
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.delete("/task/11/topics/topic-1")
+
+        self.assertEqual(200, response.status_code)
+        self.database.delete_task_topic.assert_called_once_with(11, "topic-1", 7)
+
+    def test_user_can_merge_topics_in_owned_task(self):
+        self.database.find_user_by_username.return_value = {
+            "user_id": 7,
+            "username": "alice",
+            "password_hash": generate_password_hash("secret12"),
+        }
+        self.database.merge_task_topics.return_value = {"id": "topic-1", "theme": "综合能源"}
+        self.client.post(
+            "/api/auth/login",
+            json={"username": "alice", "password": "secret12"},
+        )
+
+        response = self.client.post(
+            "/task/11/topics/merge",
+            json={"topic_ids": ["topic-1", "topic-2"], "name": "综合能源"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("综合能源", response.get_json()["data"]["theme"])
+        self.database.merge_task_topics.assert_called_once_with(
+            11, ["topic-1", "topic-2"], 7, "综合能源"
+        )
 
     def test_unauthenticated_user_cannot_extract_documents(self):
         response = self.client.post("/extract", json={"text": "测试文档内容"})

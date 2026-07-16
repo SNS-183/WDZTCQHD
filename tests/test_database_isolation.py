@@ -53,21 +53,6 @@ class DatabaseIsolationTest(unittest.TestCase):
         ):
             return callback()
 
-    def test_task_list_query_always_filters_current_user(self):
-        cursor = FakeCursor(fetchall_value=[])
-        connection = FakeConnection(cursor)
-
-        result = self.run_with_connection(
-            connection,
-            lambda: database.fetch_recent_files(7, 20),
-        )
-
-        self.assertEqual([], result)
-        query, params = cursor.calls[-1]
-        self.assertIn("WHERE at.user_id = %s", query)
-        self.assertIn("GROUP BY at.task_id", query)
-        self.assertEqual((7, 20), params)
-
     def test_task_detail_query_checks_owner(self):
         cursor = FakeCursor(fetchone_values=[None])
         connection = FakeConnection(cursor)
@@ -153,6 +138,38 @@ class DatabaseIsolationTest(unittest.TestCase):
         self.assertIn("FROM analysis_tasks", query)
         self.assertIn("WHERE user_id = %s", query)
         self.assertEqual(7, params[-1])
+
+    def test_task_page_applies_filters_and_returns_pagination(self):
+        cursor = FakeCursor(
+            fetchone_values=[{"total": 11}],
+            fetchall_value=[{"task_id": 42, "name": "能源报告"}],
+        )
+        connection = FakeConnection(cursor)
+
+        result = self.run_with_connection(
+            connection,
+            lambda: database.query_task_page(
+                7,
+                page=2,
+                page_size=10,
+                keyword="能源",
+                status="done",
+                days=30,
+                sort_order="oldest",
+            ),
+        )
+
+        self.assertEqual(11, result["pagination"]["total"])
+        self.assertEqual(2, result["pagination"]["page"])
+        self.assertEqual(42, result["items"][0]["task_id"])
+        list_query, list_params = cursor.calls[-1]
+        self.assertIn("at.user_id = %s", list_query)
+        self.assertIn("at.task_name LIKE %s", list_query)
+        self.assertIn("at.task_status = %s", list_query)
+        self.assertIn("DATE_SUB(NOW(), INTERVAL %s DAY)", list_query)
+        self.assertIn("ORDER BY at.create_time ASC", list_query)
+        self.assertEqual((10, 10), list_params[-2:])
+        self.assertEqual(7, list_params[0])
 
 
 if __name__ == "__main__":
